@@ -271,6 +271,7 @@ def extract_blocks_from_sheet(
     rows: list[tuple],
     sheet_name: str,
     source_file: str,
+    squeeze_merged: bool = True,
 ) -> list[DataBlock]:
     """
     Recorre una hoja fila por fila detectando el patrón:
@@ -279,6 +280,13 @@ def extract_blocks_from_sheet(
     [filas de datos] y devuelve un DataBlock por cada tabla
     encontrada. Tablas en formato ancho (un año por columna) se
     despivotan a formato largo (una fila por año).
+
+    `squeeze_merged` colapsa repeticiones consecutivas idénticas en
+    una fila (ver `_squeeze_merged_row`); solo tiene sentido para
+    hojas de Excel, donde ese patrón indica una celda fusionada. Un
+    CSV plano no tiene celdas fusionadas, así que valores repetidos
+    consecutivos (p. ej. varias privaciones en 0, o varios 'NA'
+    seguidos) son datos reales y deben conservarse tal cual.
     """
 
     blocks: list[DataBlock] = []
@@ -293,10 +301,10 @@ def extract_blocks_from_sheet(
 
     current_rows: list[list] = []
 
-    def flush():
+    def flush() -> bool:
 
         if not headers or not current_rows:
-            return
+            return False
 
         final_headers = _fix_blank_characteristic_header(headers)
         final_rows = current_rows
@@ -320,7 +328,7 @@ def extract_blocks_from_sheet(
             )
 
         if not final_rows:
-            return
+            return False
 
         blocks.append(
             DataBlock(
@@ -332,13 +340,19 @@ def extract_blocks_from_sheet(
             )
         )
 
+        return True
+
     for row in rows:
 
-        trimmed = _squeeze_merged_row(_trim_row(row))
+        trimmed = _trim_row(row)
+
+        if squeeze_merged:
+            trimmed = _squeeze_merged_row(trimmed)
 
         if _row_is_empty(trimmed):
 
-            flush()
+            if flush():
+                pending_title = ""
 
             headers = None
             pending_year_row = None
@@ -364,7 +378,9 @@ def extract_blocks_from_sheet(
         if headers is None or is_title_row or is_new_header_row:
 
             if is_title_row:
-                flush()
+
+                if flush():
+                    pending_title = ""
 
                 new_title = non_empty[0]
 
@@ -573,6 +589,85 @@ def _forward_fill_orphan_first_column(rows: list[list]) -> None:
             row[0] = previous[0]
 
 
+def _read_xls_sheet_rows_with_merges(sheet) -> list[list]:
+    """
+    Equivalente a _read_sheet_rows_with_merges() pero para el formato
+    binario legacy .xls (anexos del DANE de 2019-2021), leído con
+    xlrd en vez de openpyxl — mismo criterio de forward-fill vertical
+    de celdas fusionadas que solo cubren filas de datos.
+    """
+
+    rows = [
+        [
+            cell.value if cell.value != "" else None
+            for cell in sheet.row(row_index)
+        ]
+        for row_index in range(sheet.nrows)
+    ]
+
+    for merged_range in sheet.merged_cells:
+
+        row_lo, row_hi, col_lo, col_hi = merged_range
+
+        spans_one_column = (col_hi - col_lo) == 1
+
+        spans_multiple_rows = (row_hi - row_lo) > 1
+
+        if not (spans_one_column and spans_multiple_rows):
+            continue
+
+        covered_rows = range(row_lo, row_hi)
+
+        all_rows_are_data = all(
+            any(
+                isinstance(cell, (int, float))
+                for cell in rows[row_index]
+            )
+            for row_index in covered_rows
+        )
+
+        if not all_rows_are_data:
+            continue
+
+        value = rows[row_lo][col_lo]
+
+        for row_index in covered_rows:
+            rows[row_index][col_lo] = value
+
+    _forward_fill_orphan_first_column(rows)
+
+    return rows
+
+
+def extract_blocks_from_legacy_xls(path: str) -> list[DataBlock]:
+    """
+    Extrae bloques de un archivo .xls binario legacy (formato Excel
+    97-2003), que openpyxl no puede leer. Usa xlrd, la única librería
+    mantenida que sigue soportando ese formato (desde xlrd 2.0 ya no
+    soporta .xlsx, así que ambas rutas son mutuamente excluyentes).
+    """
+
+    import xlrd
+
+    workbook = xlrd.open_workbook(path, formatting_info=False)
+
+    blocks: list[DataBlock] = []
+
+    for sheet in workbook.sheets():
+
+        rows = _read_xls_sheet_rows_with_merges(sheet)
+
+        blocks.extend(
+            extract_blocks_from_sheet(
+                rows,
+                sheet_name=sheet.name,
+                source_file=path,
+            )
+        )
+
+    return blocks
+
+
 def extract_blocks_from_workbook(path: str) -> list[DataBlock]:
 
     workbook = openpyxl.load_workbook(
@@ -617,4 +712,5 @@ def extract_blocks_from_csv(path: str) -> list[DataBlock]:
         rows,
         sheet_name="csv",
         source_file=path,
+        squeeze_merged=False,
     )
