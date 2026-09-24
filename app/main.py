@@ -129,10 +129,15 @@ class JobRequest(BaseModel):
 
         return fixed
 
-    query: List[str] = Field(
-    default=["IPM"],
-    description="Lista de palabras o frases utilizadas para descubrir contenido relacionado"
-)
+    query: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Palabras o frases para filtrar el contenido descubierto. "
+            "Si no se envía (o se envía vacío), el spider NO filtra por "
+            "palabra clave: descarga todo lo que encuentre dentro de las "
+            "extensiones permitidas."
+        ),
+    )
 
     max_depth: Optional[int] = Field(
         None,
@@ -249,6 +254,12 @@ def create_job(
         else MAX_PAGES
     )
 
+    keywords = [
+        keyword.strip()
+        for keyword in (req.query or [])
+        if keyword.strip()
+    ]
+
 
 
     cmd = [
@@ -265,7 +276,7 @@ def create_job(
         f"start_urls={','.join(req.urls)}",
 
         "-a",
-        f"query={','.join(req.query)}",
+        f"query={','.join(keywords)}",
 
         "-a",
         f"max_depth={max_depth}",
@@ -376,7 +387,7 @@ def create_job(
                 req.urls,
 
             "query":
-                req.query,
+                keywords,
 
             "max_depth":
                 max_depth,

@@ -112,7 +112,7 @@ class IPMSpider(scrapy.Spider):
     def __init__(
         self,
         start_urls="",
-        query="IPM",
+        query="",
         max_depth=None,
         max_pages=None,
         allowed_domains="",
@@ -147,8 +147,10 @@ class IPMSpider(scrapy.Spider):
 
         self.query = (
             query.strip()
-            or "IPM"
         )
+
+        self.discover_all = self.query == ""
+
 
         self.query_lower = (
             self.query.lower()
@@ -274,6 +276,13 @@ class IPMSpider(scrapy.Spider):
 
 
         self.pages_seen += 1
+
+        if not self.discover_all:
+            page_score = calculate_page_score(response.url, page_text, self.query)
+            if page_score >= MIN_PAGE_SCORE:
+                self.pages_relevant += 1
+                self.logger.info("PÁGINA RELEVANTE [%s]", page_score)
+                self.logger.info("%s", response.url)
 
         if (
             self.pages_seen
@@ -404,6 +413,19 @@ class IPMSpider(scrapy.Spider):
                 )
             )
 
+            if self.is_file(url):
+                yield from self.process_file(url, link_text, response.url)
+                continue
+
+            if self.discover_all:
+                should_follow = True
+            else:
+                link_score = calculate_link_score(url, link_text, self.query)
+                should_follow = (
+                    discovery_depth < self.free_discovery_depth
+                    or link_score >= MIN_LINK_SCORE
+                )
+
 
 
             should_follow = (
@@ -432,86 +454,36 @@ class IPMSpider(scrapy.Spider):
                 )
 
 
-    def process_file(
-        self,
-        url: str,
-        link_text: str,
-        source_page: str,
-    ):
+    def process_file(self, url: str, link_text: str, source_page: str):
+        filename = get_filename(url)
 
-        score = calculate_file_score(
-    url=url,
-    link_text=link_text,
-    query=self.query,
-    source_page=source_page,
-)
-
-        filename = get_filename(
-            url
-        )
-
-
-
-        if (
-            score
-            < MIN_FILE_SCORE
-        ):
-
-            self.logger.debug(
-                "Archivo descartado [%s]: %s",
-                score,
-                filename,
+        if self.discover_all:
+            score = None
+            self.logger.debug("Archivo aceptado (sin filtro de palabra clave): %s", filename)
+        else:
+            score = calculate_file_score(
+                url=url, link_text=link_text, query=self.query, source_page=source_page,
             )
-
-            return
-
+            if score < MIN_FILE_SCORE:
+                self.logger.debug("Archivo descartado [%s]: %s", score, filename)
+                return
 
         self.files_found += 1
-
-        self.logger.info(
-            "======================================"
-        )
-
-        self.logger.info(
-            "ARCHIVO RELACIONADO ENCONTRADO"
-        )
-
-        self.logger.info(
-            "Score: %s",
-            score,
-        )
-
-        self.logger.info(
-            "Archivo: %s",
-            filename,
-        )
-
-        self.logger.info(
-            "URL: %s",
-            url,
-        )
-
-        self.logger.info(
-            "Página: %s",
-            source_page,
-        )
-
-        self.logger.info(
-            "======================================"
-        )
+        self.logger.info("======================================")
+        self.logger.info("ARCHIVO ENCONTRADO")
+        self.logger.info("Score: %s", score)
+        self.logger.info("Archivo: %s", filename)
+        self.logger.info("URL: %s", url)
+        self.logger.info("Página: %s", source_page)
+        self.logger.info("======================================")
 
         yield DataFileItem(
             file_urls=[url],
-
             source_page=source_page,
-
             original_filename=filename,
-
             score=score,
-
             query=self.query,
         )
-
 
 
     def is_file(
