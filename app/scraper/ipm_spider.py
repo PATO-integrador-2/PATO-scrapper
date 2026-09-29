@@ -35,6 +35,7 @@ from app.scraper.crawler.page_classifier import (
 
 from app.scraper.crawler.file_scorer import (
     calculate_file_score,
+    parse_query,
 )
 
 from app.scraper.pipelines.files_pipeline import (
@@ -161,7 +162,22 @@ class IPMSpider(scrapy.Spider):
             query.strip()
         )
 
-        self.discover_all = self.query == ""
+        # main.py envía varias palabras clave unidas por comas
+        # ("ipm,latam"); los scorers de página y enlace buscan el
+        # query como substring, así que se evalúa cada palabra por
+        # separado (con las regiones ya expandidas a países) y se usa
+        # el mejor score. El scorer de archivos recibe el query
+        # completo porque trata las regiones como filtro.
+        topic_keywords, region_terms = parse_query(
+            self.query
+        )
+
+        self.keywords = (
+            topic_keywords
+            + region_terms
+        )
+
+        self.discover_all = not self.keywords
 
 
         self.query_lower = (
@@ -324,36 +340,40 @@ class IPMSpider(scrapy.Spider):
 
 
 
-        page_text = " ".join(
-            response.css(
-                "body *::text"
-            ).getall()
-        )
+        if not self.discover_all:
 
-        page_score = (
-            calculate_page_score(
-                response.url,
-                page_text,
-                self.query,
-            )
-        )
-
-        if (
-            page_score
-            >= MIN_PAGE_SCORE
-        ):
-
-            self.pages_relevant += 1
-
-            self.logger.info(
-                "PÁGINA RELEVANTE [%s]",
-                page_score,
+            page_text = " ".join(
+                response.css(
+                    "body *::text"
+                ).getall()
             )
 
-            self.logger.info(
-                "%s",
-                response.url,
+            page_score = max(
+                calculate_page_score(
+                    response.url,
+                    page_text,
+                    keyword,
+                )
+                for keyword
+                in self.keywords
             )
+
+            if (
+                page_score
+                >= MIN_PAGE_SCORE
+            ):
+
+                self.pages_relevant += 1
+
+                self.logger.info(
+                    "PÁGINA RELEVANTE [%s]",
+                    page_score,
+                )
+
+                self.logger.info(
+                    "%s",
+                    response.url,
+                )
 
 
 
@@ -410,35 +430,30 @@ class IPMSpider(scrapy.Spider):
 
 
 
-            link_score = (
-                calculate_link_score(
-                    url,
-                    link_text,
-                    self.query,
-                )
-            )
-
-            if self.is_file(url):
-                yield from self.process_file(url, link_text, response.url)
-                continue
-
             if self.discover_all:
+
+                link_score = None
+
                 should_follow = True
+
             else:
-                link_score = calculate_link_score(url, link_text, self.query)
-                should_follow = (
-                    discovery_depth < self.free_discovery_depth
-                    or link_score >= MIN_LINK_SCORE
+
+                link_score = max(
+                    calculate_link_score(
+                        url,
+                        link_text,
+                        keyword,
+                    )
+                    for keyword
+                    in self.keywords
                 )
 
-
-
-            should_follow = (
-                discovery_depth
-                < self.free_discovery_depth
-                or link_score
-                >= MIN_LINK_SCORE
-            )
+                should_follow = (
+                    discovery_depth
+                    < self.free_discovery_depth
+                    or link_score
+                    >= MIN_LINK_SCORE
+                )
 
             if should_follow:
 
@@ -578,13 +593,6 @@ class IPMSpider(scrapy.Spider):
         source_page: str,
         filename_hint: str | None = None,
     ):
-
-        score = calculate_file_score(
-    url=url,
-    link_text=link_text,
-    query=self.query,
-    source_page=source_page,
-)
 
         filename = filename_hint or get_filename(
             url
