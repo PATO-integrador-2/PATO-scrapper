@@ -16,7 +16,7 @@ Además, incluye un **módulo de limpieza de datos** que toma los archivos tabul
 
 ## Tabla de contenido
 
-- [Requisitos](#requisitos)
+- [Requisitos](#requisito)
 - [Instalación](#instalación)
 - [Configuración (.env)](#configuración-env)
 - [Ejecutar el servidor](#ejecutar-el-servidor)
@@ -473,9 +473,6 @@ Cada test aísla sus datos con un nombre de área geográfica único (UUID) para
 - **Método:** `GET`
 - **URL:** `http://127.0.0.1:8000/jobs/{{job_id}}`
 
-Repite esta petición cada pocos segundos (o usa el Runner de Postman con un delay) hasta que `status` sea `completado`, `error` o `detenido`.
-
-Para detener el job manualmente: `POST http://127.0.0.1:8000/jobs/{{job_id}}/stop` (sin body).
 
 ### 3. Listar todos los jobs
 
