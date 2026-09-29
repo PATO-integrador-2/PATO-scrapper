@@ -985,9 +985,9 @@ class CepalLoadRequest(BaseModel):
         ...,
         description=(
             "ID del indicador a cargar directo a PostgreSQL. Soportados: "
-            "5554 (tabla cepal_deprivation_contribution), "
-            "4079 (tabla cepal_poverty_measure), "
-            "5595 (tabla cepal_poverty_by_age)."
+            "5554 (tabla latam_ipm_deprivation_contribution), "
+            "4079 (tabla latam_ipm_national_population), "
+            "5595 (tabla latam_ipm_age_group)."
         ),
     )
 
@@ -1002,9 +1002,9 @@ def cepal_load_db(
     ningún CSV intermedio. Requiere DATABASE_URL configurada en el .env.
 
     Indicadores soportados (ver app/cepal_pg_loader.py):
-        5554 -> cepal_deprivation_contribution
-        4079 -> cepal_poverty_measure
-        5595 -> cepal_poverty_by_age
+        5554 -> latam_ipm_deprivation_contribution
+        4079 -> latam_ipm_national_population
+        5595 -> latam_ipm_age_group
     """
 
     try:

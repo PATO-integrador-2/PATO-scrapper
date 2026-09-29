@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
 from typing import Any
 
 from urllib.parse import urlparse, unquote, parse_qsl
 
 import psycopg2
-from psycopg2.extras import execute_values
 
 from app.cepal_dimensions_export import (
     build_records,
     CepalDimensionsError,
+)
+from app.cleaner.db import load_fact_rows, transaction
+from app.cleaner.fact_tables import (
+    FactTable,
+    LATAM_IPM_AGE_GROUP,
+    LATAM_IPM_DEPRIVATION_CONTRIBUTION,
+    LATAM_IPM_NATIONAL_POPULATION,
+    build_fact_row,
 )
 
 
@@ -21,41 +27,44 @@ class CepalLoadError(Exception):
 
 # indicator_id -> configuración de carga.
 #
+# "fact" es la tabla de hechos destino (ver app/cleaner/fact_tables.py).
 # "dimension_map" traduce el NOMBRE DE DIMENSIÓN tal como lo describe
-# CEPALSTAT (clave) a la columna de la tabla destino (valor). El orden de
-# este dict determina el orden de las columnas en el INSERT.
+# CEPALSTAT (clave) a la llave lógica de la fila (valor): 'year' o el
+# concepto que referencia la tabla de hechos (p. ej. 'country' ->
+# ref_country). Todas las dimensiones son obligatorias salvo los
+# nullable_refs de la tabla de hechos.
 INDICATOR_TABLE_CONFIG: dict[int, dict[str, Any]] = {
     5554: {
-        "table": "cepal_deprivation_contribution",
+        "fact": LATAM_IPM_DEPRIVATION_CONTRIBUTION,
         "dimension_map": {
             "Country__ESTANDAR": "country",
-            "Years__ESTANDAR": "period",
+            "Years__ESTANDAR": "year",
             "Deprivation": "deprivation",
         },
     },
     4079: {
-        "table": "cepal_poverty_measure",
+        "fact": LATAM_IPM_NATIONAL_POPULATION,
         "dimension_map": {
             "Country__ESTANDAR": "country",
-            "Geographical area": "geographical_area",
-            "Years__ESTANDAR": "period",
-            "Multidimensional poverty measures": "measure",
+            "Geographical area": "geographic_area",
+            "Years__ESTANDAR": "year",
+            "Multidimensional poverty measures": "measurement_type",
         },
     },
     5595: {
-        "table": "cepal_poverty_by_age",
+        "fact": LATAM_IPM_AGE_GROUP,
         "dimension_map": {
             "Country__ESTANDAR": "country",
-            "Geographical area": "geographical_area",
-            "Years__ESTANDAR": "period",
+            "Geographical area": "geographic_area",
+            "Years__ESTANDAR": "year",
             "Age_IPM": "age_group",
         },
     },
 }
 
-# Columnas destino que son INTEGER en Postgres pero vienen como texto desde
+# Llaves lógicas que son INTEGER en Postgres pero vienen como texto desde
 # CEPALSTAT (el nombre del miembro de la dimensión de años, ej. "2008").
-_INTEGER_COLUMNS = {"period"}
+_INTEGER_COLUMNS = {"year"}
 
 
 def _get_connection():
@@ -129,30 +138,7 @@ def _get_connection():
         ) from exc
 
 
-def _clean_optional(value: Any) -> Any:
-    """
-    Convierte cadenas vacías a None (NULL). CEPALSTAT a veces devuelve ""
-    en vez de null para campos como iso3 o notes_ids cuando no aplican
-    (por ejemplo, promedios regionales sin iso3 de país).
-    """
-
-    if value is None:
-        return None
-
-    if isinstance(value, str) and value.strip() == "":
-        return None
-
-    return value
-
-
-def _build_rows_for_indicator(
-    indicator_id: int,
-) -> tuple[list[str], list[tuple]]:
-    """
-    Descarga y mapea el indicador según su configuración en
-    INDICATOR_TABLE_CONFIG, devolviendo (columnas, filas) listas para
-    insertar con execute_values.
-    """
+def _get_config(indicator_id: int) -> dict[str, Any]:
 
     config = INDICATOR_TABLE_CONFIG.get(indicator_id)
 
@@ -163,6 +149,23 @@ def _build_rows_for_indicator(
             f"carga definida. Indicadores soportados: "
             f"{list(INDICATOR_TABLE_CONFIG)}"
         )
+
+    return config
+
+
+def _build_rows_for_indicator(
+    indicator_id: int,
+) -> tuple[FactTable, list[dict], int]:
+    """
+    Descarga y mapea el indicador según su configuración en
+    INDICATOR_TABLE_CONFIG, devolviendo (tabla de hechos, filas en forma
+    lógica, cantidad de filas rechazadas por datos incompletos o no
+    numéricos).
+    """
+
+    config = _get_config(indicator_id)
+
+    fact: FactTable = config["fact"]
 
     dimension_map: dict[str, str] = config["dimension_map"]
 
@@ -180,7 +183,7 @@ def _build_rows_for_indicator(
         )
 
     # Si CEPALSTAT cambia el nombre de alguna dimensión, mejor fallar fuerte
-    # que insertar filas con columnas en NULL silenciosamente.
+    # que descartar todas las filas en silencio.
     dimensiones_disponibles = [
         k for k in records[0]
         if k not in ("value", "source_id", "notes_ids", "iso3")
@@ -200,28 +203,19 @@ def _build_rows_for_indicator(
             f"{dimensiones_disponibles}"
         )
 
-    extracted_at = datetime.now(timezone.utc)
+    rows: list[dict] = []
 
-    fixed_columns = ["value", "source_id", "notes_ids", "iso3"]
-    dim_columns = list(dimension_map.values())
-    columns = fixed_columns + dim_columns + ["extracted_at"]
-
-    rows: list[tuple] = []
+    rejected = 0
 
     for record in records:
 
-        row: list[Any] = [
-            record.get("value"),
-            record.get("source_id"),
-            _clean_optional(record.get("notes_ids")),
-            _clean_optional(record.get("iso3")),
-        ]
+        values: dict[str, Any] = {"value": record.get("value")}
 
-        for dim_name, column_name in dimension_map.items():
+        for dim_name, key in dimension_map.items():
 
             raw_value = record.get(dim_name)
 
-            if column_name in _INTEGER_COLUMNS and raw_value is not None:
+            if key in _INTEGER_COLUMNS and raw_value is not None:
 
                 try:
                     raw_value = int(raw_value)
@@ -230,56 +224,46 @@ def _build_rows_for_indicator(
 
                     raise CepalLoadError(
                         f"No se pudo convertir '{raw_value}' de la "
-                        f"dimensión '{dim_name}' a entero para la "
-                        f"columna '{column_name}'."
+                        f"dimensión '{dim_name}' a entero para '{key}'."
                     )
 
-            row.append(raw_value)
+            values[key] = raw_value
 
-        row.append(extracted_at)
+        row = build_fact_row(values, fact)
 
-        rows.append(tuple(row))
+        if row is None:
+            rejected += 1
+            continue
 
-    return columns, rows
+        rows.append(row)
+
+    return fact, rows, rejected
 
 
 def load_indicator_to_postgres(indicator_id: int) -> dict[str, Any]:
     """
-    Descarga el indicador dado desde CEPALSTAT y lo inserta directamente en
-    la tabla de Postgres correspondiente (según INDICATOR_TABLE_CONFIG),
-    sin generar ningún archivo CSV intermedio.
+    Descarga el indicador dado desde CEPALSTAT y lo carga directamente
+    en la tabla de hechos de Postgres correspondiente (según
+    INDICATOR_TABLE_CONFIG), sin generar ningún CSV intermedio. Es
+    idempotente: recargar actualiza los valores de la misma clave.
     """
 
-    config = INDICATOR_TABLE_CONFIG.get(indicator_id)
-
-    if config is None:
-
-        raise CepalLoadError(
-            f"El indicador {indicator_id} no tiene una configuración de "
-            f"carga definida. Indicadores soportados: "
-            f"{list(INDICATOR_TABLE_CONFIG)}"
-        )
-
-    table = config["table"]
-
-    columns, rows = _build_rows_for_indicator(indicator_id)
-
-    insert_sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES %s"
+    fact, rows, rejected = _build_rows_for_indicator(indicator_id)
 
     conn = _get_connection()
 
     try:
 
-        with conn:
+        with transaction(conn):
 
             with conn.cursor() as cur:
 
-                execute_values(cur, insert_sql, rows, page_size=1000)
+                inserted = load_fact_rows(cur, fact, rows)
 
     except psycopg2.Error as exc:
 
         raise CepalLoadError(
-            f"Error insertando en la tabla '{table}': {exc}"
+            f"Error insertando en la tabla '{fact.table}': {exc}"
         ) from exc
 
     finally:
@@ -288,7 +272,7 @@ def load_indicator_to_postgres(indicator_id: int) -> dict[str, Any]:
 
     return {
         "indicator_id": indicator_id,
-        "tabla": table,
-        "filas_insertadas": len(rows),
-        "columnas": columns,
+        "tabla": fact.table,
+        "filas_insertadas": inserted,
+        "filas_rechazadas": rejected,
     }

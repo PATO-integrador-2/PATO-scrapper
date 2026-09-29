@@ -12,12 +12,12 @@ sobre cada archivo descargado del job:
 1. **Extracción** — `block_extractor.py`: separa cada hoja en tablas individuales (bloques).
 2. **Normalización** — `normalizer.py`: repara texto, tipa valores, quita duplicados.
 3. **Clasificación** — `table_mapper.py`: decide a qué sub-tabla pertenece cada bloque.
-4. **Exportación / Carga** — `exporter.py` + `loader.py`: CSV/Excel y, para 3 tablas, PostgreSQL.
+4. **Exportación / Carga** — `exporter.py` + `loader.py`: CSV/Excel y, para 7 tablas, PostgreSQL.
 
 El resultado son 9 sub-tablas planas (una por tipo de indicador del IPM) más un cajón
 `sin_clasificar` para lo que no se pudo mapear, exportadas como CSV individuales y como un único
-`datos_limpios.xlsx`. De esas 9, 6 tienen un mapeo acordado hacia el esquema estrella de
-PostgreSQL; el resto queda disponible solo como archivo.
+`datos_limpios.xlsx`. De esas 9, 7 se cargan a las tablas de
+`clean_data_db`; el resto queda disponible solo como archivo.
 
 ## 1. Extracción de bloques
 
@@ -169,52 +169,46 @@ alguien los revise a mano.
 
 ## 5. Carga a PostgreSQL
 
-De las 9 sub-tablas, 6 tienen un mapeo acordado hacia el esquema estrella real de la base de
-datos (`geographic_area` / `indicator` / `ipm_statistic`), definido en `star_schema_mapper.py`:
+De las 9 sub-tablas, 7 se cargan a `clean_data_db`, cuya estructura es normalizada: los textos
+repetidos (dominio, sexo, variable, dimensión, ...) viven en tablas `ref_<concepto>` y cada tabla de
+hechos los referencia con `<concepto>_id`. El mapeo está en `fact_tables.py`:
 
-| Sub-tabla | indicator.code | breakdown_type | Vista de referencia |
+| Sub-tabla | Tabla de hechos | Referencias | Vista |
 |---|---|---|---|
-| `ipm_por_dominio` | `MPI` | `none` | `vw_ipm_by_domain` |
-| `proporcion_privaciones` | `INTENSITY_A` | `none` | `vw_average_deprivations` |
-| `privaciones_por_hogar` | un código por variable (ver abajo) | `none` | `vw_deprivations_by_variable` |
-| `contribuciones_incidencia` | un código por dimensión (ver abajo) | `none` | `vw_dimension_contribution` |
-| `incidencia_por_sexo_jefe_hogar` | `MPI` | `household_head_sex` | `vw_incidence_by_household_head_sex` |
-| `incidencia_por_sexo_persona` | `MPI` | `person_sex` | `vw_incidence_by_person_sex` |
+| `ipm_por_dominio` | `ipm_incidence` | `domain` | `vw_ipm_incidence` |
+| `privaciones_por_hogar` | `ipm_deprivations_variable` | `domain`, `variable` | `vw_ipm_deprivations_variable` |
+| `proporcion_privaciones` | `ipm_deprivation_proportion` | `domain` | `vw_ipm_deprivation_proportion` |
+| `contribuciones_incidencia` | `ipm_contribution_dimension` | `domain`, `dimension` | `vw_ipm_contribution_dimension` |
+| `incidencia_por_sexo_persona` | `ipm_incidence_person_sex` | `domain`, `sex` | `vw_ipm_incidence_person_sex` |
+| `incidencia_por_sexo_jefe_hogar` | `ipm_incidence_household_head_sex` | `domain`, `sex` | `vw_ipm_incidence_household_head_sex` |
+| `dashboard_02` | `ipm_household_departmental` | — (códigos de región/departamento) | `vw_ipm_household_departmental` |
 
-Las 3 sub-tablas restantes (`dashboard_02`, `contribucion_relativa_privaciones`,
-`poblacion_pobreza_multidimensional`) se siguen exportando a CSV/Excel, pero se omiten de la
-carga a PostgreSQL hasta que el equipo acuerde su convención de `indicator.code`.
+Las 2 sub-tablas de dashboard_03 (`contribucion_relativa_privaciones`,
+`poblacion_pobreza_multidimensional`) se siguen exportando a CSV/Excel y se omiten de esta carga: las
+tablas `latam_ipm_*` se alimentan desde CEPALSTAT (`POST /cepal/load-db`).
 
-### Slug de indicador (para privaciones_por_hogar y contribuciones_incidencia)
+### Traducción de filas
 
-Como `privaciones_por_hogar` y `contribuciones_incidencia` no tienen un indicador fijo (cada
-variable de privación, o cada dimensión, es su propio indicador), `_slug_indicator_code()` genera
-el código a partir del nombre de la variable/dimensión: mayúsculas, sin tildes, símbolos
-reemplazados por guion bajo, truncado a 50 caracteres (límite de `varchar(50)` en la columna). Es
-determinístico — el mismo texto de entrada siempre produce el mismo código — para que el
-`UPSERT` sea idempotente. `indicator.category` queda como `privation_variable` o `dimension`
-respectivamente, según `StarMapping.indicator_category_from_column`.
-
-**Variable:** `Privación por Analfabetismo` → **indicator.code:** `PRIVACION_POR_ANALFABETISMO`
-
-**Dimensión:** `Condiciones Educativas` → **indicator.code:** `CONDICIONES_EDUCATIVAS`
-
-### Breakdown (desagregación por sexo)
-
-`incidencia_por_sexo_jefe_hogar` e `incidencia_por_sexo_persona` comparten el mismo
-`indicator.code` (`MPI`) que `ipm_por_dominio`, pero se distinguen por `breakdown_type`
-(`household_head_sex` / `person_sex`) y `breakdown_value` (el valor de la columna `sexo` del
-bloque de origen, p. ej. `Hombre`/`Mujer`). Sin esto, sus filas chocarían con las de
-`ipm_por_dominio` en la clave única de `ipm_statistic`.
+Cada fila plana (`anio`, `dominio`, ...) se traduce a una forma lógica (`year`, `domain`, `value`,
+`extracted_at`) con `flat_row_to_fact_row()`. Se rechaza (cuenta en `rechazadas`) si falta el año, el
+valor no es numérico finito, o algún texto de referencia obligatorio está vacío. Los registros de
+CEPALSTAT pasan por la misma validación (`build_fact_row()`), así que hay un único camino de carga.
 
 ### Upsert idempotente
 
 La carga completa de un job corre dentro de **una sola transacción**: si alguna tabla falla, se
-revierte todo el job (no quedan cargas parciales). Cada fila se resuelve así:
+revierte todo el job (no quedan cargas parciales, tampoco filas nuevas de `ref_*`). Por tabla:
 
-1. `get_or_create_geographic_area()` busca o crea el área por `(name, level)`.
-2. `get_or_create_indicator()` hace `UPSERT` por `code` (único).
-3. `upsert_ipm_statistics()` inserta/actualiza la fila de `ipm_statistic` usando como clave
-   `(geographic_area_id, indicator_id, period, breakdown_type, breakdown_value)` — volver a
-   cargar el mismo job no duplica filas, las actualiza.
+1. `resolve_ref_ids()` busca los textos en `ref_<concepto>` y solo inserta los que faltan.
+2. `upsert_fact_rows()` inserta/actualiza con `ON CONFLICT (year, <ids>) DO UPDATE` y refresca
+   `loaded_at`; volver a cargar el mismo job no duplica filas, las actualiza.
 
+### Microdato de hogares
+
+`dashboard_02` no tiene clave `UNIQUE` en la base (cada fila es un perfil de hogar), así que en vez de
+un upsert se **reemplazan los años presentes en el job**: `delete_households_by_year()` borra esas filas
+y se insertan las nuevas en la misma transacción. La tabla guarda solo `region_code` y
+`department_code`; los nombres los resuelve la vista con `ref_department` y `ref_region` (versionado
+por año). Se rechazan los hogares incompletos o con un departamento ausente de `ref_department`. El
+microdato 2024 no trae `REGION` y `region_code` es `NOT NULL`: esas filas se guardan con el código `0`,
+que la vista muestra como `Sin clasificar`.

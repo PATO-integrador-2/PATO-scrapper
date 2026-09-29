@@ -8,43 +8,37 @@ from pathlib import Path
 import psycopg2
 
 from app.cleaner.db import (
+    delete_households_by_year,
     get_connection,
-    get_or_create_geographic_area,
-    get_or_create_geographic_area_by_code,
-    get_or_create_indicator,
-    insert_household_records,
+    get_department_codes,
+    insert_household_rows,
+    load_fact_rows,
     transaction,
-    upsert_household_deprivations,
-    upsert_ipm_statistics,
+)
+from app.cleaner.fact_tables import (
+    FACT_TABLES,
+    flat_row_to_fact_row,
+    get_fact_table_for_flat,
 )
 from app.cleaner.household_mapper import row_to_household
 from app.cleaner.schema import ALL_TABLES, ColumnSpec
-from app.cleaner.star_schema_mapper import get_star_mapping, row_to_statistic
 
 
 logger = logging.getLogger("cleaner.loader")
 
 LOG_FILE_NAME = "carga_log.json"
 
-# Solo estas sub-tablas tienen una convención de indicator.code
-# acordada con el equipo (ver vw_ipm_by_domain, vw_average_deprivations,
-# vw_deprivations_by_variable, vw_incidence_by_dimension,
-# vw_incidence_by_household_head_sex, vw_incidence_by_person_sex). El
-# resto se sigue exportando a CSV/Excel pero no se carga a PostgreSQL
-# hasta que se defina su mapeo.
-LOADABLE_TABLES = (
-    "ipm_por_dominio",
-    "proporcion_privaciones",
-    "privaciones_por_hogar",
-    "contribuciones_incidencia",
-    "incidencia_por_sexo_jefe_hogar",
-    "incidencia_por_sexo_persona",
+# Sub-tablas planas que alimentan una tabla de hechos de clean_data_db
+# (ver fact_tables.py). El resto se sigue exportando a CSV/Excel pero
+# no se carga a PostgreSQL: las de dashboard_03 (contribucion_relativa_
+# privaciones, poblacion_pobreza_multidimensional) se cargan desde
+# CEPALSTAT (app/cepal_pg_loader.py), no desde los anexos del DANE.
+LOADABLE_TABLES = tuple(
+    fact.flat_table for fact in FACT_TABLES if fact.flat_table
 )
 
-# dashboard_02 no se carga al esquema estrella (geographic_area /
-# indicator / ipm_statistic) sino al esquema normalizado de
-# microdato: household_record / household_deprivation (ver
-# household_mapper.py y la vista de referencia "Base de hogares").
+# dashboard_02 es microdato de hogares: va a ipm_household_departmental
+# (ver household_mapper.py), no a una tabla de hechos con ref_*.
 HOUSEHOLD_TABLE = "dashboard_02"
 
 
@@ -96,9 +90,9 @@ def read_table_csv(csv_path: Path, spec) -> list[dict]:
 def load_tables_from_dir(clean_dir: Path, job_id: str | None = None) -> dict:
     """
     Lee los CSV generados por clean_job_files() en `clean_dir`
-    (uno por sub-tabla) y carga a PostgreSQL las sub-tablas que ya
-    tienen mapeo acordado al esquema estrella (LOADABLE_TABLES),
-    usando UPSERT idempotente. Requiere que DATABASE_URL esté
+    (uno por sub-tabla) y carga a PostgreSQL las sub-tablas que
+    alimentan una tabla de hechos (LOADABLE_TABLES) más el microdato
+    de hogares, de forma idempotente. Requiere que DATABASE_URL esté
     configurada en el .env. Registra el resultado en
     <clean_dir>/carga_log.json.
     """
@@ -117,8 +111,8 @@ def load_tables_from_dir(clean_dir: Path, job_id: str | None = None) -> dict:
 
 def load_tables(mapped_tables: dict[str, list[dict]]) -> dict:
     """
-    Carga a PostgreSQL las sub-tablas con mapeo definido al esquema
-    estrella (geographic_area / indicator / ipm_statistic), todo
+    Carga a PostgreSQL las sub-tablas con tabla de hechos (ver
+    fact_tables.py) y el microdato de hogares (dashboard_02), todo
     dentro de una única transacción: si una tabla falla, se revierte
     toda la carga del job (atomicidad), evitando estados parciales
     en la base de datos compartida. Requiere que DATABASE_URL esté
@@ -158,7 +152,7 @@ def load_tables(mapped_tables: dict[str, list[dict]]) -> dict:
                 "rechazadas": 0,
                 "omitidas": len(rows),
                 "motivo": (
-                    "Sin mapeo acordado al esquema de PostgreSQL; "
+                    "Sin tabla de hechos en PostgreSQL para este origen; "
                     "disponible solo en el CSV/Excel exportado."
                 ),
             }
@@ -202,195 +196,78 @@ def _load_table(cursor, table_name: str, rows: list[dict]) -> dict:
     if not rows:
         return {"insertadas": 0, "rechazadas": 0}
 
-    mapping = get_star_mapping(table_name)
+    fact = get_fact_table_for_flat(table_name)
 
-    if mapping is None:
+    if fact is None:
         return {
             "insertadas": 0,
             "rechazadas": len(rows),
-            "error": f"No hay mapeo de esquema estrella para '{table_name}'.",
+            "error": f"No hay tabla de hechos para '{table_name}'.",
         }
 
-    statistics = []
+    fact_rows = []
 
     rejected = 0
 
     for row in rows:
 
-        statistic = row_to_statistic(row, mapping)
+        fact_row = flat_row_to_fact_row(row, fact)
 
-        if statistic is None:
+        if fact_row is None:
             rejected += 1
             continue
 
-        statistics.append(statistic)
+        fact_rows.append(fact_row)
 
-    resolved_rows = []
-
-    for statistic in statistics:
-
-        geo_id = get_or_create_geographic_area(
-            cursor,
-            name=statistic["geo_name"],
-            level=statistic["geo_level"],
-        )
-
-        indicator_id = get_or_create_indicator(
-            cursor,
-            code=statistic["indicator_code"],
-            name=statistic["indicator_name"],
-            category=statistic["indicator_category"],
-        )
-
-        resolved_rows.append(
-            {
-                "geographic_area_id": geo_id,
-                "indicator_id": indicator_id,
-                "period": statistic["period"],
-                "value": statistic["value"],
-                "breakdown_type": statistic["breakdown_type"],
-                "breakdown_value": statistic["breakdown_value"],
-                "source": statistic["source"],
-                "extracted_at": statistic["extracted_at"],
-            }
-        )
-
-    inserted = upsert_ipm_statistics(cursor, resolved_rows)
+    inserted = load_fact_rows(cursor, fact, fact_rows)
 
     return {"insertadas": inserted, "rechazadas": rejected}
 
 
 def _load_household_table(cursor, rows: list[dict]) -> dict:
     """
-    Carga dashboard_02 (perfiles de hogar del microdato del DANE) al
-    esquema normalizado household_record / household_deprivation. A
-    diferencia de _load_table, cada fila requiere resolver dos
-    niveles de geographic_area (región -> departamento, vía
-    parent_id) y produce N filas de household_deprivation por hogar
-    (una por variable de privación presente).
+    Carga dashboard_02 (perfiles de hogar del microdato del DANE) a
+    ipm_household_departmental. Se rechazan las filas incompletas y las
+    de un departamento que no existe en ref_department.
 
-    Solo hay 39 áreas geográficas posibles (6 regiones + 33
-    departamentos) y 15 indicadores de privación fijos, así que se
-    resuelven una sola vez y se cachean en memoria — sin esto, un
-    archivo de ~18.700 hogares dispara cientos de miles de
-    round-trips redundantes a la base de datos (uno por privación por
-    hogar) para resolver siempre los mismos 15 códigos.
+    La tabla no tiene UNIQUE, así que para que recargar sea idempotente
+    se reemplazan por completo los años presentes en el job: se borran
+    sus filas y se insertan las nuevas dentro de la misma transacción.
     """
 
     if not rows:
         return {"insertadas": 0, "rechazadas": 0}
 
-    rejected = 0
-
-    geo_cache: dict[tuple[str, str], str] = {}
-
-    indicator_cache: dict[str, str] = {}
+    valid_departments = get_department_codes(cursor)
 
     households: list[dict] = []
+
+    rejected = 0
 
     for row in rows:
 
         household = row_to_household(row)
 
-        if household is None:
+        if (
+            household is None
+            or household["department_code"] not in valid_departments
+        ):
             rejected += 1
             continue
 
         households.append(household)
 
-    # Fase 1: resolver geographic_area (región/departamento) e
-    # indicator una sola vez por código distinto, no por hogar.
-    for household in households:
-
-        region_id = None
-
-        if household["region_code"] is not None:
-
-            region_key = ("region", household["region_code"])
-
-            region_id = geo_cache.get(region_key)
-
-            if region_id is None:
-
-                region_id = get_or_create_geographic_area_by_code(
-                    cursor,
-                    level="region",
-                    official_code=household["region_code"],
-                    name=household["region_name"],
-                )
-
-                geo_cache[region_key] = region_id
-
-        departamento_key = ("departamento", household["departamento_code"])
-
-        departamento_id = geo_cache.get(departamento_key)
-
-        if departamento_id is None:
-
-            departamento_id = get_or_create_geographic_area_by_code(
-                cursor,
-                level="departamento",
-                official_code=household["departamento_code"],
-                name=household["departamento_name"],
-                parent_id=region_id,
-            )
-
-            geo_cache[departamento_key] = departamento_id
-
-        household["_geographic_area_id"] = departamento_id
-
-        for deprivation in household["deprivations"]:
-
-            indicator_code = deprivation["indicator_code"]
-
-            if indicator_code in indicator_cache:
-                continue
-
-            indicator_cache[indicator_code] = get_or_create_indicator(
-                cursor,
-                code=indicator_code,
-                name=deprivation["indicator_name"],
-                category=deprivation["indicator_category"],
-            )
-
-    # Fase 2: insertar todos los household_record en un solo batch
-    # (sin buscar coincidencias previas, ver insert_household_records)
-    # y usar los ids devueltos, en el mismo orden, para construir las
-    # filas de household_deprivation.
-    household_record_ids = insert_household_records(
+    replaced = delete_households_by_year(
         cursor,
-        [
-            {
-                "geographic_area_id": household["_geographic_area_id"],
-                "period": household["period"],
-                "household_size": household["household_size"],
-                "ipm_value": household["ipm_value"],
-                "is_poor": household["is_poor"],
-                "source": household["source"],
-                "extracted_at": household["extracted_at"],
-            }
-            for household in households
-        ],
+        sorted({household["year"] for household in households}),
     )
 
-    all_deprivation_rows = [
-        {
-            "household_record_id": household_record_id,
-            "indicator_id": indicator_cache[deprivation["indicator_code"]],
-            "has_deprivation": deprivation["has_deprivation"],
-        }
-        for household, household_record_id in zip(households, household_record_ids)
-        for deprivation in household["deprivations"]
-    ]
-
-    inserted_deprivations = upsert_household_deprivations(
-        cursor, all_deprivation_rows
-    )
+    inserted = insert_household_rows(cursor, households)
 
     return {
-        "insertadas": len(household_record_ids),
+        "insertadas": inserted,
         "rechazadas": rejected,
-        "privaciones_insertadas": inserted_deprivations,
+        "reemplazadas": replaced,
     }
 
 

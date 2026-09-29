@@ -5,10 +5,13 @@ from contextlib import contextmanager
 import psycopg2
 import psycopg2.extras
 
+from app.cleaner.fact_tables import REF_CONCEPTS, FactTable
 from app.config import DATABASE_URL
 
 
 logger = logging.getLogger("cleaner.db")
+
+HOUSEHOLD_TABLE_NAME = "ipm_household_departmental"
 
 
 def get_connection():
@@ -40,123 +43,168 @@ def transaction(conn):
         raise
 
 
-def get_or_create_geographic_area(
+def resolve_ref_ids(cursor, concept: str, values) -> dict[str, int]:
+    """
+    Devuelve {texto: id} para los `values` en ref_<concept>, creando
+    las filas que falten. Cada tabla ref_ tiene un id IDENTITY
+    smallint, así que primero se consultan los textos existentes y solo
+    se insertan los nuevos: un INSERT ... ON CONFLICT DO NOTHING
+    consumiría un id de la secuencia por cada texto ya existente en
+    cada carga y acabaría desbordando el smallint.
+    """
+
+    if concept not in REF_CONCEPTS:
+        raise ValueError(f"Tabla de referencia desconocida: ref_{concept}")
+
+    distinct = sorted({value for value in values if value is not None})
+
+    if not distinct:
+        return {}
+
+    table = f"ref_{concept}"
+
+    cursor.execute(
+        f"SELECT {concept}, {concept}_id FROM {table} "
+        f"WHERE {concept} = ANY(%s)",
+        (distinct,),
+    )
+
+    ids = {text: ref_id for text, ref_id in cursor.fetchall()}
+
+    missing = [value for value in distinct if value not in ids]
+
+    if missing:
+
+        created = psycopg2.extras.execute_values(
+            cursor,
+            f"INSERT INTO {table} ({concept}) VALUES %s "
+            f"RETURNING {concept}, {concept}_id",
+            [(value,) for value in missing],
+            fetch=True,
+        )
+
+        ids.update({text: ref_id for text, ref_id in created})
+
+    return ids
+
+
+def upsert_fact_rows(
     cursor,
-    name: str,
-    level: str,
-) -> str:
+    fact: FactTable,
+    rows: list[dict],
+    ref_ids: dict[str, dict[str, int]],
+) -> int:
     """
-    Resuelve el id de geographic_area por (name, level); lo crea si
-    no existe todavía. geographic_area no tiene una restricción
-    UNIQUE de negocio, así que la deduplicación la hace la
-    aplicación vía SELECT-then-INSERT dentro de la misma transacción.
-    """
+    Inserta/actualiza `rows` (forma lógica, ver fact_tables.py) en la
+    tabla de hechos, idempotente por su clave UNIQUE
+    (year + un id por cada concepto referenciado). `ref_ids` es
+    {concepto: {texto: id}} tal como lo devuelve resolve_ref_ids.
 
-    cursor.execute(
-        "SELECT id FROM geographic_area WHERE name = %s AND level = %s",
-        (name, level),
-    )
-
-    row = cursor.fetchone()
-
-    if row:
-        return row[0]
-
-    cursor.execute(
-        "INSERT INTO geographic_area (level, name) "
-        "VALUES (%s, %s) RETURNING id",
-        (level, name),
-    )
-
-    return cursor.fetchone()[0]
-
-
-def get_or_create_indicator(
-    cursor,
-    code: str,
-    name: str,
-    category: str,
-) -> str:
-    """
-    Resuelve el id de indicator por su código único; lo crea si no
-    existe. indicator.code sí tiene UNIQUE, así que aquí se puede
-    usar ON CONFLICT de forma segura.
-    """
-
-    cursor.execute(
-        """
-        INSERT INTO indicator (code, name, category)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (code) DO UPDATE SET
-            name = EXCLUDED.name,
-            category = EXCLUDED.category
-        RETURNING id
-        """,
-        (code, name, category),
-    )
-
-    return cursor.fetchone()[0]
-
-
-def upsert_ipm_statistics(cursor, rows: list[dict]) -> int:
-    """
-    Inserta/actualiza filas de ipm_statistic, idempotente por la
-    clave UNIQUE real de la tabla
-    (geographic_area_id, indicator_id, period, breakdown_type,
-    breakdown_value).
+    Si la misma clave aparece más de una vez en el lote gana la última:
+    PostgreSQL rechaza un ON CONFLICT DO UPDATE que toque dos veces la
+    misma fila en un solo INSERT.
     """
 
     if not rows:
         return 0
 
-    insert_sql = """
-        INSERT INTO ipm_statistic (
-            geographic_area_id, indicator_id, period,
-            breakdown_type, breakdown_value,
-            value, source, extracted_at
+    id_columns = [f"{concept}_id" for concept in fact.refs]
+
+    key_columns = ["year", *id_columns]
+
+    columns = [*key_columns, fact.value_column, "extracted_at"]
+
+    values_by_key: dict[tuple, tuple] = {}
+
+    for row in rows:
+
+        ids = tuple(
+            None
+            if row[concept] is None
+            else ref_ids[concept][row[concept]]
+            for concept in fact.refs
         )
-        VALUES %s
-        ON CONFLICT (
-            geographic_area_id, indicator_id, period,
-            breakdown_type, breakdown_value
-        ) DO UPDATE SET
-            value = EXCLUDED.value,
-            source = EXCLUDED.source,
-            extracted_at = EXCLUDED.extracted_at,
-            loaded_at = now()
+
+        key = (row["year"], *ids)
+
+        values_by_key[key] = (*key, row["value"], row["extracted_at"])
+
+    insert_sql = (
+        f"INSERT INTO {fact.table} ({', '.join(columns)}) VALUES %s "
+        f"ON CONFLICT ({', '.join(key_columns)}) DO UPDATE SET "
+        f"{fact.value_column} = EXCLUDED.{fact.value_column}, "
+        "extracted_at = EXCLUDED.extracted_at, "
+        "loaded_at = CURRENT_DATE"
+    )
+
+    psycopg2.extras.execute_values(
+        cursor,
+        insert_sql,
+        list(values_by_key.values()),
+        page_size=1000,
+    )
+
+    return len(values_by_key)
+
+
+def load_fact_rows(cursor, fact: FactTable, rows: list[dict]) -> int:
+    """
+    Carga filas en forma lógica a `fact`: resuelve (o crea) los ids de
+    las tablas ref_ que referencia y hace el upsert. Es el único camino
+    de carga para las tablas de hechos, tanto desde el cleaner (DANE)
+    como desde CEPALSTAT.
     """
 
-    values = [
-        (
-            row["geographic_area_id"],
-            row["indicator_id"],
-            row["period"],
-            row.get("breakdown_type", "none"),
-            row.get("breakdown_value", "none"),
-            row["value"],
-            row["source"],
-            row["extracted_at"],
+    if not rows:
+        return 0
+
+    ref_ids = {
+        concept: resolve_ref_ids(
+            cursor, concept, (row[concept] for row in rows)
         )
-        for row in rows
-    ]
+        for concept in fact.refs
+    }
 
-    psycopg2.extras.execute_values(cursor, insert_sql, values)
-
-    return len(rows)
+    return upsert_fact_rows(cursor, fact, rows, ref_ids)
 
 
-def upsert_rows(
-    conn,
-    table_name: str,
-    rows: list[dict],
-    natural_key: tuple[str, ...],
-) -> int:
+def get_department_codes(cursor) -> set[int]:
     """
-    Inserta `rows` en `table_name`, actualizando la fila existente
-    cuando su clave natural (`natural_key`) ya está presente
-    (UPSERT idempotente vía ON CONFLICT). Uso genérico para tablas
-    planas con clave natural propia; no aplica a ipm_statistic (usa
-    upsert_ipm_statistics, que resuelve las FK primero).
+    Códigos DANE de ref_department (catálogo cargado por el DBA junto
+    con el esquema). Se consulta para rechazar hogares con un
+    departamento desconocido en vez de que la FK tumbe todo el job.
+    """
+
+    cursor.execute("SELECT department_code FROM public.ref_department")
+
+    return {row[0] for row in cursor.fetchall()}
+
+
+def delete_households_by_year(cursor, years: list[int]) -> int:
+    """
+    ipm_household_departmental no tiene UNIQUE (cada fila es un perfil
+    de hogar) y por eso no admite UPSERT: para que recargar un año sea
+    idempotente se borran sus filas antes de insertarlas de nuevo,
+    dentro de la misma transacción de la carga.
+    """
+
+    if not years:
+        return 0
+
+    cursor.execute(
+        f"DELETE FROM public.{HOUSEHOLD_TABLE_NAME} WHERE year = ANY(%s)",
+        (list(years),),
+    )
+
+    return cursor.rowcount
+
+
+def insert_household_rows(cursor, rows: list[dict]) -> int:
+    """
+    Inserta perfiles de hogar en un solo batch. Cada dict de `rows`
+    trae ya las columnas de ipm_household_departmental (year,
+    region_code, department_code, household_members, dep_*, ipm_score,
+    is_poor, extracted_at), todos con las mismas llaves.
     """
 
     if not rows:
@@ -164,157 +212,16 @@ def upsert_rows(
 
     columns = list(rows[0].keys())
 
-    update_columns = [
-        column
-        for column in columns
-        if column not in natural_key
-    ]
-
     insert_sql = (
-        f'INSERT INTO {table_name} ({", ".join(columns)}) '
-        f'VALUES %s '
-        f'ON CONFLICT ({", ".join(natural_key)}) DO UPDATE SET '
-        + ", ".join(
-            f"{column} = EXCLUDED.{column}"
-            for column in update_columns
-        )
+        f"INSERT INTO public.{HOUSEHOLD_TABLE_NAME} "
+        f"({', '.join(columns)}) VALUES %s"
     )
 
-    values = [
-        tuple(row[column] for column in columns)
-        for row in rows
-    ]
-
-    with conn.cursor() as cursor:
-
-        psycopg2.extras.execute_values(
-            cursor,
-            insert_sql,
-            values,
-        )
-
-    return len(rows)
-
-
-def get_or_create_geographic_area_by_code(
-    cursor,
-    level: str,
-    official_code: str,
-    name: str,
-    parent_id: str | None = None,
-) -> str:
-    """
-    Resuelve el id de geographic_area por (level, official_code); lo
-    crea si no existe. Se usa para jerarquías con código oficial DANE
-    (región/departamento del microdato de hogares), separado de
-    get_or_create_geographic_area (que resuelve por nombre, usado por
-    el esquema estrella de dominios) porque las filas creadas por uno
-    y otro camino no comparten la misma clave de búsqueda.
-    """
-
-    cursor.execute(
-        "SELECT id FROM geographic_area WHERE level = %s AND official_code = %s",
-        (level, official_code),
+    psycopg2.extras.execute_values(
+        cursor,
+        insert_sql,
+        [tuple(row[column] for column in columns) for row in rows],
+        page_size=1000,
     )
-
-    row = cursor.fetchone()
-
-    if row:
-        return row[0]
-
-    cursor.execute(
-        "INSERT INTO geographic_area (level, official_code, name, parent_id) "
-        "VALUES (%s, %s, %s, %s) RETURNING id",
-        (level, official_code, name, parent_id),
-    )
-
-    return cursor.fetchone()[0]
-
-
-def insert_household_records(
-    cursor,
-    rows: list[dict],
-) -> list[str]:
-    """
-    Inserta filas nuevas en household_record en un solo batch y
-    devuelve sus ids en el mismo orden de `rows`. household_record no
-    tiene restricción UNIQUE — cada fila representa un perfil de
-    hogar (geo + tamaño + IPM + pobre + su conjunto de privaciones)
-    ya deduplicado río arriba por table_mapper._dedupe_rows usando la
-    clave natural completa de dashboard_02 (que sí incluye las 15
-    privaciones). Deduplicar aquí solo por
-    (geographic_area_id, period, household_size, ipm_value, is_poor)
-    —sin las privaciones— colapsaría hogares distintos que comparten
-    esos cinco campos pero difieren en qué privaciones sufren, así
-    que se inserta siempre en vez de buscar coincidencias previas;
-    recargar el mismo job duplica los perfiles, igual que duplicaría
-    filas en el CSV de origen si se reprocesara sin deduplicar.
-    Cada dict de `rows` debe traer: geographic_area_id, period,
-    household_size, ipm_value, is_poor, source, extracted_at.
-    """
-
-    if not rows:
-        return []
-
-    insert_sql = """
-        INSERT INTO household_record (
-            geographic_area_id, period, household_size,
-            ipm_value, is_poor, source, extracted_at
-        )
-        VALUES %s
-        RETURNING id
-    """
-
-    values = [
-        (
-            row["geographic_area_id"],
-            row["period"],
-            row["household_size"],
-            row["ipm_value"],
-            row["is_poor"],
-            row["source"],
-            row["extracted_at"],
-        )
-        for row in rows
-    ]
-
-    ids = psycopg2.extras.execute_values(
-        cursor, insert_sql, values, fetch=True
-    )
-
-    return [row[0] for row in ids]
-
-
-def upsert_household_deprivations(
-    cursor,
-    rows: list[dict],
-) -> int:
-    """
-    Inserta/actualiza filas de household_deprivation, idempotente por
-    la clave primaria compuesta (household_record_id, indicator_id).
-    """
-
-    if not rows:
-        return 0
-
-    insert_sql = """
-        INSERT INTO household_deprivation (
-            household_record_id, indicator_id, has_deprivation
-        )
-        VALUES %s
-        ON CONFLICT (household_record_id, indicator_id) DO UPDATE SET
-            has_deprivation = EXCLUDED.has_deprivation
-    """
-
-    values = [
-        (
-            row["household_record_id"],
-            row["indicator_id"],
-            row["has_deprivation"],
-        )
-        for row in rows
-    ]
-
-    psycopg2.extras.execute_values(cursor, insert_sql, values)
 
     return len(rows)

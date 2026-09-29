@@ -122,10 +122,10 @@ app/
     ├── schema.py                 # Definición declarativa de las sub-tablas del esquema objetivo
     ├── table_mapper.py           # Clasifica bloques en sub-tablas y mapea sus columnas
     ├── exporter.py                # Exporta cada sub-tabla como CSV y a un Excel consolidado
-    ├── db.py                     # Conexión a PostgreSQL, transacciones y UPSERT idempotente
+    ├── db.py                     # Conexión a PostgreSQL, transacciones, resolución de ref_* y UPSERT de hechos
+    ├── fact_tables.py            # Especificación de las tablas de hechos de clean_data_db y validación de filas
+    ├── household_mapper.py       # Traduce dashboard_02 (microdato de hogares) a ipm_household_departmental
     ├── loader.py                 # Carga los CSV de un job a PostgreSQL y registra el resultado
-    ├── star_schema_mapper.py     # Traduce sub-tablas planas al esquema estrella real (geographic_area/indicator/ipm_statistic)
-    ├── ddl.sql                   # DDL de referencia (histórico; el esquema real en BD es geographic_area/indicator/ipm_statistic, ver más abajo)
     └── text_utils.py             # Utilidades de texto compartidas
 run.py                            # Punto de entrada (uvicorn)
 Formato de Datos.xlsx             # Plantilla/layout de referencia para el esquema de salida
@@ -275,7 +275,7 @@ También acepta `sin_clasificar`: no es una sub-tabla del esquema, sino un CSV a
 
 ### `POST /jobs/{job_id}/clean/load`
 
-Carga a PostgreSQL las sub-tablas ya limpiadas de este job que tienen mapeo acordado al esquema estrella real (`ipm_por_dominio`, `proporcion_privaciones`, `privaciones_por_hogar` — ver [Carga a PostgreSQL](#carga-a-postgresql)), con `UPSERT` idempotente. Toda la carga del job corre en **una sola transacción**: si alguna tabla falla, se revierte el job completo (no quedan filas parciales). Requiere `DATABASE_URL` configurada en `.env`; devuelve `503` si no lo está. El resultado queda registrado en `downloads/<job_id>/datos_limpios/carga_log.json`.
+Carga a PostgreSQL las sub-tablas ya limpiadas de este job que alimentan una tabla de hechos de `clean_data_db` (las 6 de dashboard 1) más el microdato de hogares `dashboard_02` — ver [Carga a PostgreSQL](#carga-a-postgresql) —, de forma idempotente. Toda la carga del job corre en **una sola transacción**: si alguna tabla falla, se revierte el job completo (no quedan filas parciales). Requiere `DATABASE_URL` configurada en `.env`; devuelve `503` si no lo está. El resultado queda registrado en `downloads/<job_id>/datos_limpios/carga_log.json`.
 
 **Respuesta:**
 
@@ -351,31 +351,33 @@ Bloques que no calzan con ninguna sub-tabla quedan en `sin_clasificar.csv` (tít
 
 ### Carga a PostgreSQL
 
-La base de datos compartida del proyecto (`clean_data_db`) usa un **esquema estrella** ya provisionado por el equipo, distinto de las 9 sub-tablas planas de arriba:
+La base compartida (`clean_data_db`) está **normalizada**: cada texto repetido (dominio, país, sexo, variable, etc.) vive una sola vez en una tabla `ref_<concepto>` (`ref_domain`, `ref_country`, `ref_sex`, ...) y las tablas de hechos lo referencian con `<concepto>_id`. Cada tabla de hechos tiene su propia clave `UNIQUE` (`year` + los ids de referencia) y se consulta a través de una vista `vw_*` que devuelve los textos ya resueltos.
 
-| Tabla | Descripción |
-|---|---|
-| `geographic_area` | Catálogo de áreas geográficas (`id`, `parent_id`, `level`, `name`, `country_iso_code`, `official_code`). Sin `UNIQUE` de negocio — la deduplicación por `(name, level)` la hace la aplicación. |
-| `indicator` | Catálogo de indicadores (`id`, `code` único, `name`, `category`). |
-| `ipm_statistic` | Tabla de hechos (`geographic_area_id`, `indicator_id`, `period`, `breakdown_type`, `breakdown_value`, `value`, `source`, `extracted_at`, `loaded_at`), con `UNIQUE(geographic_area_id, indicator_id, period, breakdown_type, breakdown_value)` como clave natural real. |
+Las sub-tablas planas se cargan así (definido en `app/cleaner/fact_tables.py`):
 
-De las 9 sub-tablas planas, solo **3 tienen convención de `indicator.code` acordada** (fijada por las vistas SQL ya existentes en la base — `vw_ipm_by_domain`, `vw_average_deprivations`, `vw_deprivations_by_variable`) y por eso son las únicas que `POST /jobs/{job_id}/clean/load` carga a `ipm_statistic`:
+| Sub-tabla plana | Tabla de hechos | Referencias |
+|---|---|---|
+| `ipm_por_dominio` | `ipm_incidence` | `domain` |
+| `privaciones_por_hogar` | `ipm_deprivations_variable` | `domain`, `variable` |
+| `proporcion_privaciones` | `ipm_deprivation_proportion` | `domain` |
+| `contribuciones_incidencia` | `ipm_contribution_dimension` | `domain`, `dimension` |
+| `incidencia_por_sexo_persona` | `ipm_incidence_person_sex` | `domain`, `sex` |
+| `incidencia_por_sexo_jefe_hogar` | `ipm_incidence_household_head_sex` | `domain`, `sex` |
+| `dashboard_02` | `ipm_household_departmental` | (microdato, ver abajo) |
 
-| Sub-tabla plana | `indicator.code` | `indicator.category` | `breakdown_type` |
-|---|---|---|---|
-| `ipm_por_dominio` | `MPI` (fijo) | `mpi` | `none` |
-| `proporcion_privaciones` | `INTENSITY_A` (fijo) | `intensity` | `none` |
-| `privaciones_por_hogar` | uno por `variable` (slug en mayúsculas, truncado a 50 caracteres) | `privation_variable` | `none` |
+Las tablas de Latinoamérica (`latam_ipm_deprivation_contribution`, `latam_ipm_national_population`, `latam_ipm_age_group`) se cargan desde CEPALSTAT con `POST /cepal/load-db` (indicadores 5554, 4079 y 5595), no desde los anexos del DANE; por eso `contribucion_relativa_privaciones` y `poblacion_pobreza_multidimensional` se siguen exportando a CSV/Excel pero el reporte de `clean/load` las marca como `omitidas`.
 
-El mapeo lo hace `app/cleaner/star_schema_mapper.py`; `app/cleaner/loader.py` resuelve/crea las filas de `geographic_area` e `indicator` que falten y hace `UPSERT` idempotente (`ON CONFLICT ... DO UPDATE`) sobre la clave natural real de `ipm_statistic`, por lo que reejecutar la carga no duplica filas ni indicadores.
+**Referencias (`ref_*`)**: `app/cleaner/db.py::resolve_ref_ids` consulta los textos que ya existen y solo inserta los nuevos (el `id` es `IDENTITY smallint`: un `INSERT ... ON CONFLICT DO NOTHING` gastaría un id por cada texto ya existente en cada carga). `ref_department` y `ref_region` las provee el script de la BD: el scraper no las modifica.
 
-Las otras 6 sub-tablas (`contribuciones_incidencia`, `incidencia_por_sexo_persona`, `incidencia_por_sexo_jefe_hogar`, `dashboard_02`, `contribucion_relativa_privaciones`, `poblacion_pobreza_multidimensional`) **no se cargan a PostgreSQL todavía** — el reporte las marca como `omitidas` con el motivo — porque no tienen convención de `indicator.code`/`breakdown_type` acordada con el equipo (en particular `dashboard_02`, que trae microdatos de hogar con 15 privaciones booleanas por fila y no encaja directamente en el modelo `indicator + value` de una métrica por fila). Siguen disponibles como CSV/Excel para descarga manual.
+**Upsert idempotente**: `upsert_fact_rows` hace `ON CONFLICT (year, <ids>) DO UPDATE` y actualiza `loaded_at`; volver a cargar el mismo job no duplica filas. Si una clave se repite dentro de un mismo lote gana la última fila. `extracted_at` y `loaded_at` son de tipo `DATE`.
+
+**Microdato de hogares (`dashboard_02` → `ipm_household_departmental`)**: la tabla guarda solo `region_code` y `department_code`; los nombres los resuelve la vista con `ref_department` y `ref_region` (versionado por año, la codificación cambió en 2025). Como no tiene `UNIQUE`, cada carga **reemplaza los años presentes en el job** (borra sus filas e inserta las nuevas en la misma transacción), así que recargar no duplica hogares. Se rechazan las filas incompletas y las de un departamento que no esté en `ref_department`. `region_code` es `NOT NULL`: el microdato 2024 no trae `REGION`, y esas filas se guardan con el código `0` (`REGION_SIN_CLASIFICAR`), que la vista muestra como `Sin clasificar`.
 
 **Transacciones y manejo de errores**: toda la carga de un job corre dentro de una única transacción (`app/cleaner/db.py::transaction`) — si cualquier tabla falla (error de datos o de conexión), se revierte el job completo, evitando estados parciales en la base compartida. Los errores de PostgreSQL (`psycopg2.Error`) se capturan y se reportan por tabla sin tumbar el proceso.
 
 **Registro del resultado**: cada ejecución de `POST /jobs/{job_id}/clean/load` agrega una entrada a `downloads/<job_id>/datos_limpios/carga_log.json` (fecha, totales insertados/rechazados, éxito, detalle por tabla), acumulando el historial de todos los intentos de carga de ese job. Se consulta con `GET /jobs/{job_id}/clean/load/log`.
 
-El DDL histórico de las 9 tablas planas (no usado por la carga real, que apunta al esquema estrella) está en [ddl.sql](app/cleaner/ddl.sql), como referencia de los tipos de dato de cada columna.
+El esquema real de la base (tablas `ref_*`, tablas de hechos, vistas y permisos por rol) está en el script `clean_data_db_normalizado.sql` que mantiene el equipo de base de datos.
 
 **Uso típico:**
 
@@ -390,7 +392,7 @@ curl -o datos_limpios.xlsx http://127.0.0.1:8000/jobs/{job_id}/clean/download
 # 3b. O descarga solo el CSV de una sub-tabla específica
 curl -o ipm_por_dominio.csv http://127.0.0.1:8000/jobs/{job_id}/clean/download/ipm_por_dominio
 
-# 4. (Opcional, requiere DATABASE_URL en .env) Carga las 3 sub-tablas soportadas a PostgreSQL
+# 4. (Opcional, requiere DATABASE_URL en .env) Carga a PostgreSQL las sub-tablas con tabla de hechos y el microdato de hogares
 curl -X POST http://127.0.0.1:8000/jobs/{job_id}/clean/load
 
 # 5. Revisa el historial de cargas de este job
@@ -414,14 +416,14 @@ curl http://127.0.0.1:8000/jobs/{job_id}/clean/load/log
 
 ## Pruebas
 
-Las pruebas de carga e integración (`tests/test_loader.py`) corren contra la base de datos real definida en `DATABASE_URL` (no hay mocks): validan inserción, idempotencia del `UPSERT`, actualización de valores, rechazo de filas inválidas, el rollback transaccional ante un error a mitad de carga, y el registro en `carga_log.json`. Se saltan automáticamente si `DATABASE_URL` no está configurada o la base no es accesible (`tests/conftest.py::requires_db`).
+Las pruebas de carga e integración (`tests/test_loader.py`) corren contra la base de datos real definida en `DATABASE_URL` (no hay mocks): validan inserción, idempotencia del `UPSERT`, actualización de valores, rechazo de filas inválidas, reemplazo por año del microdato de hogares, la carga de las tablas `latam_*` (incluido `measurement_type` NULL), el rollback transaccional ante un error a mitad de carga, y el registro en `carga_log.json`. Las pruebas de mapeo (`fact_tables.py`, `household_mapper.py`) no necesitan base de datos. Se saltan automáticamente si `DATABASE_URL` no está configurada o la base no es accesible (`tests/conftest.py::requires_db`).
 
 ```bash
 pip install -r requirements.txt   # incluye pytest
 python -m pytest tests/ -v
 ```
 
-Cada test aísla sus datos con un nombre de área geográfica único (UUID) para no chocar entre corridas ni con datos reales — el usuario de servicio (`scraper_service`) solo tiene permisos `INSERT`/`SELECT`/`UPDATE` en la base compartida (sin `DELETE`, por diseño), así que las filas de prueba no se limpian al terminar, pero quedan marcadas con `geographic_area.name` empezando en `__test__`.
+Los tests usan valores reales (`Nacional`, `Costa Rica`, `Analfabetismo`, ...) y se aíslan por año: todo se carga con `TEST_YEAR` (1901, un año sin datos reales) y al terminar se borran las filas de hechos de ese año (`scraper_service` tiene `DELETE` sobre ellas). Los textos de `ref_*` son los mismos que usan los datos reales, así que no dejan basura ahí.
 
 ---
 
