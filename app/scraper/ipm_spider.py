@@ -289,13 +289,6 @@ class IPMSpider(scrapy.Spider):
 
         self.pages_seen += 1
 
-        if not self.discover_all:
-            page_score = calculate_page_score(response.url, page_text, self.query)
-            if page_score >= MIN_PAGE_SCORE:
-                self.pages_relevant += 1
-                self.logger.info("PÁGINA RELEVANTE [%s]", page_score)
-                self.logger.info("%s", response.url)
-
         if (
             self.pages_seen
             > self.max_pages
