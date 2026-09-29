@@ -161,7 +161,18 @@ class IPMSpider(scrapy.Spider):
             query.strip()
         )
 
-        self.discover_all = self.query == ""
+        # main.py envía varias palabras clave unidas por comas
+        # ("ipm,pobreza"); los scorers buscan el query como substring,
+        # así que se evalúa cada palabra por separado y se usa el
+        # mejor score.
+        self.keywords = [
+            keyword.strip()
+            for keyword
+            in self.query.split(",")
+            if keyword.strip()
+        ]
+
+        self.discover_all = not self.keywords
 
 
         self.query_lower = (
@@ -289,13 +300,6 @@ class IPMSpider(scrapy.Spider):
 
         self.pages_seen += 1
 
-        if not self.discover_all:
-            page_score = calculate_page_score(response.url, page_text, self.query)
-            if page_score >= MIN_PAGE_SCORE:
-                self.pages_relevant += 1
-                self.logger.info("PÁGINA RELEVANTE [%s]", page_score)
-                self.logger.info("%s", response.url)
-
         if (
             self.pages_seen
             > self.max_pages
@@ -331,36 +335,40 @@ class IPMSpider(scrapy.Spider):
 
 
 
-        page_text = " ".join(
-            response.css(
-                "body *::text"
-            ).getall()
-        )
+        if not self.discover_all:
 
-        page_score = (
-            calculate_page_score(
-                response.url,
-                page_text,
-                self.query,
-            )
-        )
-
-        if (
-            page_score
-            >= MIN_PAGE_SCORE
-        ):
-
-            self.pages_relevant += 1
-
-            self.logger.info(
-                "PÁGINA RELEVANTE [%s]",
-                page_score,
+            page_text = " ".join(
+                response.css(
+                    "body *::text"
+                ).getall()
             )
 
-            self.logger.info(
-                "%s",
-                response.url,
+            page_score = max(
+                calculate_page_score(
+                    response.url,
+                    page_text,
+                    keyword,
+                )
+                for keyword
+                in self.keywords
             )
+
+            if (
+                page_score
+                >= MIN_PAGE_SCORE
+            ):
+
+                self.pages_relevant += 1
+
+                self.logger.info(
+                    "PÁGINA RELEVANTE [%s]",
+                    page_score,
+                )
+
+                self.logger.info(
+                    "%s",
+                    response.url,
+                )
 
 
 
@@ -417,35 +425,30 @@ class IPMSpider(scrapy.Spider):
 
 
 
-            link_score = (
-                calculate_link_score(
-                    url,
-                    link_text,
-                    self.query,
-                )
-            )
-
-            if self.is_file(url):
-                yield from self.process_file(url, link_text, response.url)
-                continue
-
             if self.discover_all:
+
+                link_score = None
+
                 should_follow = True
+
             else:
-                link_score = calculate_link_score(url, link_text, self.query)
-                should_follow = (
-                    discovery_depth < self.free_discovery_depth
-                    or link_score >= MIN_LINK_SCORE
+
+                link_score = max(
+                    calculate_link_score(
+                        url,
+                        link_text,
+                        keyword,
+                    )
+                    for keyword
+                    in self.keywords
                 )
 
-
-
-            should_follow = (
-                discovery_depth
-                < self.free_discovery_depth
-                or link_score
-                >= MIN_LINK_SCORE
-            )
+                should_follow = (
+                    discovery_depth
+                    < self.free_discovery_depth
+                    or link_score
+                    >= MIN_LINK_SCORE
+                )
 
             if should_follow:
 
@@ -586,13 +589,6 @@ class IPMSpider(scrapy.Spider):
         filename_hint: str | None = None,
     ):
 
-        score = calculate_file_score(
-    url=url,
-    link_text=link_text,
-    query=self.query,
-    source_page=source_page,
-)
-
         filename = filename_hint or get_filename(
             url
         )
@@ -603,9 +599,9 @@ class IPMSpider(scrapy.Spider):
             score = None
             self.logger.debug("Archivo aceptado (sin filtro de palabra clave): %s", filename)
         else:
-            score = calculate_file_score(
-                url=url, link_text=link_text, query=self.query, source_page=source_page,
-            )
+            score = max(calculate_file_score(
+                url=url, link_text=link_text, query=keyword, source_page=source_page,
+            ) for keyword in self.keywords)
             if score < MIN_FILE_SCORE:
                 self.logger.debug("Archivo descartado [%s]: %s", score, filename)
                 return
