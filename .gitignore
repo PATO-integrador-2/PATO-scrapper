@@ -21,6 +21,8 @@ downloads/
 .vscode/
 .idea/
 
+.secrets
+
 # Windows
 Thumbs.db
 .env
