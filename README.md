@@ -16,7 +16,7 @@ Además, incluye un **módulo de limpieza de datos** que toma los archivos tabul
 
 ## Tabla de contenido
 
-- [Requisitos](#requisito)
+- [Requisitos](#requisitos)
 - [Instalación](#instalación)
 - [Configuración (.env)](#configuración-env)
 - [Ejecutar el servidor](#ejecutar-el-servidor)
