@@ -161,7 +161,18 @@ class IPMSpider(scrapy.Spider):
             query.strip()
         )
 
-        self.discover_all = self.query == ""
+        # main.py envía varias palabras clave unidas por comas
+        # ("ipm,pobreza"); los scorers buscan el query como substring,
+        # así que se evalúa cada palabra por separado y se usa el
+        # mejor score.
+        self.keywords = [
+            keyword.strip()
+            for keyword
+            in self.query.split(",")
+            if keyword.strip()
+        ]
+
+        self.discover_all = not self.keywords
 
 
         self.query_lower = (
@@ -332,12 +343,14 @@ class IPMSpider(scrapy.Spider):
                 ).getall()
             )
 
-            page_score = (
+            page_score = max(
                 calculate_page_score(
                     response.url,
                     page_text,
-                    self.query,
+                    keyword,
                 )
+                for keyword
+                in self.keywords
             )
 
             if (
@@ -420,12 +433,14 @@ class IPMSpider(scrapy.Spider):
 
             else:
 
-                link_score = (
+                link_score = max(
                     calculate_link_score(
                         url,
                         link_text,
-                        self.query,
+                        keyword,
                     )
+                    for keyword
+                    in self.keywords
                 )
 
                 should_follow = (
@@ -584,9 +599,9 @@ class IPMSpider(scrapy.Spider):
             score = None
             self.logger.debug("Archivo aceptado (sin filtro de palabra clave): %s", filename)
         else:
-            score = calculate_file_score(
-                url=url, link_text=link_text, query=self.query, source_page=source_page,
-            )
+            score = max(calculate_file_score(
+                url=url, link_text=link_text, query=keyword, source_page=source_page,
+            ) for keyword in self.keywords)
             if score < MIN_FILE_SCORE:
                 self.logger.debug("Archivo descartado [%s]: %s", score, filename)
                 return
