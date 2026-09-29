@@ -289,13 +289,6 @@ class IPMSpider(scrapy.Spider):
 
         self.pages_seen += 1
 
-        if not self.discover_all:
-            page_score = calculate_page_score(response.url, page_text, self.query)
-            if page_score >= MIN_PAGE_SCORE:
-                self.pages_relevant += 1
-                self.logger.info("PÁGINA RELEVANTE [%s]", page_score)
-                self.logger.info("%s", response.url)
-
         if (
             self.pages_seen
             > self.max_pages
@@ -331,36 +324,38 @@ class IPMSpider(scrapy.Spider):
 
 
 
-        page_text = " ".join(
-            response.css(
-                "body *::text"
-            ).getall()
-        )
+        if not self.discover_all:
 
-        page_score = (
-            calculate_page_score(
-                response.url,
-                page_text,
-                self.query,
-            )
-        )
-
-        if (
-            page_score
-            >= MIN_PAGE_SCORE
-        ):
-
-            self.pages_relevant += 1
-
-            self.logger.info(
-                "PÁGINA RELEVANTE [%s]",
-                page_score,
+            page_text = " ".join(
+                response.css(
+                    "body *::text"
+                ).getall()
             )
 
-            self.logger.info(
-                "%s",
-                response.url,
+            page_score = (
+                calculate_page_score(
+                    response.url,
+                    page_text,
+                    self.query,
+                )
             )
+
+            if (
+                page_score
+                >= MIN_PAGE_SCORE
+            ):
+
+                self.pages_relevant += 1
+
+                self.logger.info(
+                    "PÁGINA RELEVANTE [%s]",
+                    page_score,
+                )
+
+                self.logger.info(
+                    "%s",
+                    response.url,
+                )
 
 
 
@@ -417,35 +412,28 @@ class IPMSpider(scrapy.Spider):
 
 
 
-            link_score = (
-                calculate_link_score(
-                    url,
-                    link_text,
-                    self.query,
-                )
-            )
-
-            if self.is_file(url):
-                yield from self.process_file(url, link_text, response.url)
-                continue
-
             if self.discover_all:
+
+                link_score = None
+
                 should_follow = True
+
             else:
-                link_score = calculate_link_score(url, link_text, self.query)
-                should_follow = (
-                    discovery_depth < self.free_discovery_depth
-                    or link_score >= MIN_LINK_SCORE
+
+                link_score = (
+                    calculate_link_score(
+                        url,
+                        link_text,
+                        self.query,
+                    )
                 )
 
-
-
-            should_follow = (
-                discovery_depth
-                < self.free_discovery_depth
-                or link_score
-                >= MIN_LINK_SCORE
-            )
+                should_follow = (
+                    discovery_depth
+                    < self.free_discovery_depth
+                    or link_score
+                    >= MIN_LINK_SCORE
+                )
 
             if should_follow:
 
@@ -585,13 +573,6 @@ class IPMSpider(scrapy.Spider):
         source_page: str,
         filename_hint: str | None = None,
     ):
-
-        score = calculate_file_score(
-    url=url,
-    link_text=link_text,
-    query=self.query,
-    source_page=source_page,
-)
 
         filename = filename_hint or get_filename(
             url
