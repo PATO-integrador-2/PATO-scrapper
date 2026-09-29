@@ -179,7 +179,10 @@ def _monitor_job(
         if not job:
             return
 
-        if process.returncode == 0:
+        if job["status"] == "detenido":
+            pass
+
+        elif process.returncode == 0:
             job["status"] = "completado"
 
         else:
@@ -421,6 +424,63 @@ def create_job(
     }
 
 
+
+
+@app.post("/jobs/{job_id}/stop")
+def stop_jobs(
+    job_id: str,
+):
+
+    with jobs_lock:
+
+        job = jobs.get(
+            job_id
+        )
+
+        if not job:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Job no encontrado.",
+            )
+
+        if job["status"] != "en_progreso":
+
+            raise HTTPException(
+                status_code=409,
+                detail="El job no está en progreso.",
+            )
+
+        job["status"] = "detenido"
+
+        process = job["process"]
+
+    if os.name == "nt":
+        # /T mata también los procesos hijos de Scrapy
+        subprocess.run(
+            [
+                "taskkill",
+                "/PID",
+                str(process.pid),
+                "/T",
+                "/F",
+            ],
+            capture_output=True,
+        )
+
+    else:
+        process.terminate()
+
+    try:
+        process.wait(timeout=10)
+
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+    return {
+        "job_id": job_id,
+        "status": "detenido",
+    }
 
 
 @app.get("/jobs")

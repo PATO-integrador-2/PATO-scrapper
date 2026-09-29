@@ -35,6 +35,7 @@ from app.scraper.crawler.page_classifier import (
 
 from app.scraper.crawler.file_scorer import (
     calculate_file_score,
+    parse_query,
 )
 
 from app.scraper.pipelines.files_pipeline import (
@@ -162,15 +163,19 @@ class IPMSpider(scrapy.Spider):
         )
 
         # main.py envía varias palabras clave unidas por comas
-        # ("ipm,pobreza"); los scorers buscan el query como substring,
-        # así que se evalúa cada palabra por separado y se usa el
-        # mejor score.
-        self.keywords = [
-            keyword.strip()
-            for keyword
-            in self.query.split(",")
-            if keyword.strip()
-        ]
+        # ("ipm,latam"); los scorers de página y enlace buscan el
+        # query como substring, así que se evalúa cada palabra por
+        # separado (con las regiones ya expandidas a países) y se usa
+        # el mejor score. El scorer de archivos recibe el query
+        # completo porque trata las regiones como filtro.
+        topic_keywords, region_terms = parse_query(
+            self.query
+        )
+
+        self.keywords = (
+            topic_keywords
+            + region_terms
+        )
 
         self.discover_all = not self.keywords
 
@@ -599,9 +604,9 @@ class IPMSpider(scrapy.Spider):
             score = None
             self.logger.debug("Archivo aceptado (sin filtro de palabra clave): %s", filename)
         else:
-            score = max(calculate_file_score(
-                url=url, link_text=link_text, query=keyword, source_page=source_page,
-            ) for keyword in self.keywords)
+            score = calculate_file_score(
+                url=url, link_text=link_text, query=self.query, source_page=source_page,
+            )
             if score < MIN_FILE_SCORE:
                 self.logger.debug("Archivo descartado [%s]: %s", score, filename)
                 return

@@ -1,5 +1,0 @@
-Usage
-=====
-  scrapy runspider [options] <spider_file>
-python.exe -m scrapy: error: File not found: D:\GitHub\PATO-scrapper\app\scraper\ipm_spider.py
-

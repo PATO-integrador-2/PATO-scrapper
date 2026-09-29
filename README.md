@@ -206,7 +206,19 @@ Consulta el estado de un job y los archivos encontrados hasta el momento.
 }
 ```
 
-`status` puede ser: `en_progreso`, `completado`, `error`.
+`status` puede ser: `en_progreso`, `completado`, `error`, `detenido`.
+
+### `POST /jobs/{job_id}/stop`
+
+Detiene manualmente un job que está en ejecución. Mata el proceso de Scrapy (en Windows con `taskkill /T /F`, que incluye procesos hijos; en otros sistemas con `terminate()` y `kill()` si tarda más de 10 s) y marca el job como `detenido`. No recibe body. Los archivos ya descargados se conservan y siguen disponibles en `/download`, `/log` y `/clean`.
+
+**Respuesta:**
+
+```json
+{ "job_id": "3f2a1c7e-...", "status": "detenido" }
+```
+
+Devuelve `404` si el job no existe y `409` si no está `en_progreso`. El cierre es forzado, por lo que un archivo que se estuviera descargando en ese momento puede quedar incompleto.
 
 ### `GET /jobs/{job_id}/download/{filename}`
 
@@ -461,7 +473,9 @@ Cada test aísla sus datos con un nombre de área geográfica único (UUID) para
 - **Método:** `GET`
 - **URL:** `http://127.0.0.1:8000/jobs/{{job_id}}`
 
-Repite esta petición cada pocos segundos (o usa el Runner de Postman con un delay) hasta que `status` sea `completado` o `error`.
+Repite esta petición cada pocos segundos (o usa el Runner de Postman con un delay) hasta que `status` sea `completado`, `error` o `detenido`.
+
+Para detener el job manualmente: `POST http://127.0.0.1:8000/jobs/{{job_id}}/stop` (sin body).
 
 ### 3. Listar todos los jobs
 
