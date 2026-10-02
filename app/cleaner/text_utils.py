@@ -7,39 +7,45 @@ ENCODING_FIXES = {
 }
 
 
+MOJIBAKE_SIGNATURES = (
+    "Ã©", "Ã¡", "Ã", "Ã³", "Ãº", "Ã±", "Ã¼",
+    "Ã", "Ã‰", "Ã", "Ã“", "Ãš", "Ã‘",
+    "â€", "â€™", "â€œ", "â€", "â€¦",
+    "Â¡", "Â¿", "Â°",
+)
+
+
+def _mojibake_score(text: str) -> int:
+    """Cuenta cuántas secuencias típicas de mojibake aparecen."""
+    return sum(text.count(sig) for sig in MOJIBAKE_SIGNATURES)
+
+
 def fix_mojibake(value: str) -> str:
     """
     Repara texto mal decodificado (mojibake) proveniente de
-    archivos que originalmente estaban en latin-1/cp1252 y
-    fueron leídos como utf-8 (o viceversa).
-    """
+    archivos que originalmente estaban en UTF-8 y fueron leídos
+    como latin-1/cp1252 (o viceversa).
 
+    Elige el candidato con menos "señales" de mojibake, no solo
+    contando el carácter de reemplazo (�), porque el mojibake
+    típico (Ã©, Ã³, Ã±) no incluye ese carácter.
+    """
     if not value:
         return value
 
     candidates = [value]
 
     try:
-        candidates.append(
-            value.encode("latin-1").decode("utf-8")
-        )
+        candidates.append(value.encode("latin-1").decode("utf-8"))
     except (UnicodeDecodeError, UnicodeEncodeError):
         pass
 
     try:
-        candidates.append(
-            value.encode("cp1252").decode("utf-8")
-        )
+        candidates.append(value.encode("cp1252").decode("utf-8"))
     except (UnicodeDecodeError, UnicodeEncodeError):
         pass
 
-    best = min(
-        candidates,
-        key=lambda text: text.count("�"),
-    )
-
-    return best
-
+    return min(candidates, key=_mojibake_score)
 
 def normalize_text(value) -> str:
     """

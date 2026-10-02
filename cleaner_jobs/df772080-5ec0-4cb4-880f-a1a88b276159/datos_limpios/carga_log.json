@@ -1,0 +1,48 @@
+{
+  "job_id": "df772080-5ec0-4cb4-880f-a1a88b276159",
+  "generated_at": "2026-10-02T08:54:31.059604+00:00",
+  "report": {
+    "ipm_por_dominio": {
+      "insertadas": 166,
+      "rechazadas": 0
+    },
+    "proporcion_privaciones": {
+      "insertadas": 147,
+      "rechazadas": 0
+    },
+    "privaciones_por_hogar": {
+      "insertadas": 809,
+      "rechazadas": 0
+    },
+    "contribuciones_incidencia": {
+      "insertadas": 595,
+      "rechazadas": 0
+    },
+    "incidencia_por_sexo_jefe_hogar": {
+      "insertadas": 271,
+      "rechazadas": 0
+    },
+    "incidencia_por_sexo_persona": {
+      "insertadas": 272,
+      "rechazadas": 0
+    },
+    "dashboard_02": {
+      "insertadas": 0,
+      "rechazadas": 0,
+      "omitidas": 0,
+      "motivo": "Sin mapping de publicación"
+    },
+    "contribucion_relativa_privaciones": {
+      "insertadas": 0,
+      "rechazadas": 0,
+      "omitidas": 0,
+      "motivo": "Sin mapping de publicación"
+    },
+    "poblacion_pobreza_multidimensional": {
+      "insertadas": 0,
+      "rechazadas": 0,
+      "omitidas": 0,
+      "motivo": "Sin mapping de publicación"
+    }
+  }
+}
