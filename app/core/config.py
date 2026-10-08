@@ -58,7 +58,7 @@ class Settings:
     discovery_same_domain_only:bool=True
     discovery_request_timeout:float=45.0
 
-    # --- Knowledge ingestion desde crawler (cola + worker) ---
+    # --- Knowledge worker ---
     knowledge_ingest_enabled:bool=True
     knowledge_ingest_url:str='http://localhost:8000/knowledge/ingest'
     knowledge_ingest_timeout:float=120.0
@@ -66,6 +66,11 @@ class Settings:
     knowledge_worker_interval_seconds:float=30.0
     knowledge_worker_batch_size:int=10
     knowledge_worker_max_attempts:int=3
+
+    # --- Extracción de PDF ---
+    # Umbral mínimo de letras por chunk. Chunks por debajo de este ratio
+    # se consideran tablas/ruido numérico y se descartan antes de embeber.
+    pdf_min_letter_ratio: float = 0.40
 
 def _dsn(prefix, default_host, default_name, default_user):
     url=os.getenv(f'{prefix}_DATABASE_URL')
@@ -100,4 +105,6 @@ def load_settings(service_name:str)->Settings:
       knowledge_worker_interval_seconds=float(os.getenv('KNOWLEDGE_WORKER_INTERVAL_SECONDS','30')),
       knowledge_worker_batch_size=int(os.getenv('KNOWLEDGE_WORKER_BATCH_SIZE','10')),
       knowledge_worker_max_attempts=int(os.getenv('KNOWLEDGE_WORKER_MAX_ATTEMPTS','3')),
+      # --- Extracción de PDF ---
+      pdf_min_letter_ratio=float(os.getenv('PDF_MIN_LETTER_RATIO','0.40')),
     )

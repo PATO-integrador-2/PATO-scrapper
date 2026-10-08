@@ -24,10 +24,14 @@ from app.db.repository import IngestionRepository
 
 log = logging.getLogger("services.knowledge_worker")
 
+
 # Textos de anchor genéricos que no aportan información como título.
+# Cuando el título del PDF es uno de estos, se usa el nombre del archivo.
 GENERIC_TITLES = {
     "descargar", "download", "ver", "ver más", "ver mas",
-    "aquí", "aqui", "click aquí", "click aqui", "leer más", "leer mas",
+    "aquí", "aqui", "click aquí", "click aqui",
+    "leer más", "leer mas", "presentación", "presentacion",
+    "documento", "archivo", "pdf",
 }
 
 
@@ -64,8 +68,7 @@ class KnowledgeIngestionWorker:
 
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             for row in rows:
-                # Si el título es genérico o vacío, usa el nombre del archivo
-                # como título. Los anchors del DANE suelen decir "Descargar".
+                # Si el título es genérico o vacío, usa el nombre del archivo.
                 title = (row["title"] or "").strip()
                 if not title or title.lower() in GENERIC_TITLES:
                     filename = urlparse(row["pdf_url"]).path.split("/")[-1]

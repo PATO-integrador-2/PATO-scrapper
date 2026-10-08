@@ -7,6 +7,7 @@ from app.services.ingestion import IngestionService
 from app.services.cepal_api_ingestion import CepalAPIIngestionService
 
 
+
 def build_router(settings: Settings) -> APIRouter:
     router = APIRouter(prefix="/ingestion", tags=["ingestion"])
 
@@ -82,6 +83,39 @@ def build_router(settings: Settings) -> APIRouter:
         """Estadísticas de la cola de PDFs pendientes/fallidos/procesados."""
         return await request.app.state.ingestion_repo.knowledge_queue_stats()
 
+    @router.post("/knowledge/queue/reset-done")
+    async def knowledge_queue_reset_done(
+        request: Request,
+        run_id: UUID | None = None,
+    ) -> dict:
+        """
+        Resetea a 'pending' los items con status='done'.
+        Si se pasa run_id, solo los de ese run.
+        """
+        pool = request.app.state.db_pool
+        if run_id:
+            result = await pool.execute(
+                """
+                UPDATE ingestion.pending_knowledge_ingestion
+                SET status='pending', attempts=0, last_error=NULL, updated_at=now()
+                WHERE status='done' AND run_id=$1
+                """,
+                run_id,
+            )
+        else:
+            result = await pool.execute(
+                """
+                UPDATE ingestion.pending_knowledge_ingestion
+                SET status='pending', attempts=0, last_error=NULL, updated_at=now()
+                WHERE status='done'
+                """
+            )
+        try:
+            n = int(result.split()[-1])
+        except (ValueError, IndexError):
+            n = 0
+        return {"reset": n}
+
     @router.get("/knowledge/queue/items")
     async def knowledge_queue_items(
         request: Request,
@@ -125,5 +159,46 @@ def build_router(settings: Settings) -> APIRouter:
         return {"reset": int(result.split()[-1]) if result else 0}
 
     return router
+
+    @router.post("/knowledge/queue/reset-done")
+    async def knowledge_queue_reset_done(
+        request: Request,
+        run_id: UUID | None = None,
+        confirm: bool = Query(default=False),
+    ) -> dict:
+        """
+        Resetea a 'pending' los items con status='done'.
+        - Sin run_id: TODOS los done.
+        - Con run_id: solo los de ese run.
+        - Requiere ?confirm=true para evitar resets accidentales.
+        """
+        if not confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="reset_done_requires_confirm",
+            )
+        pool = request.app.state.db_pool
+        if run_id:
+            result = await pool.execute(
+                """
+                UPDATE ingestion.pending_knowledge_ingestion
+                SET status='pending', attempts=0, last_error=NULL, updated_at=now()
+                WHERE status='done' AND run_id=$1
+                """,
+                run_id,
+            )
+        else:
+            result = await pool.execute(
+                """
+                UPDATE ingestion.pending_knowledge_ingestion
+                SET status='pending', attempts=0, last_error=NULL, updated_at=now()
+                WHERE status='done'
+                """
+            )
+        try:
+            n = int(result.split()[-1])
+        except (ValueError, IndexError):
+            n = 0
+        return {"reset": n}
 
 
