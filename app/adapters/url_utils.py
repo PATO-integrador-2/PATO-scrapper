@@ -11,10 +11,31 @@ _FILE_EXTENSIONS = {".csv", ".xlsx", ".xls", ".json", ".pdf", ".zip"}
 
 
 def normalize_url(url: str) -> str:
-    parsed = urlparse(url.strip())
+    """
+    Normaliza una URL para deduplicación y para que sea descargable:
+    - colapsa backslashes a forward slashes (bug de Windows)
+    - elimina el fragmento (#...)
+    - ordena los query params
+    - elimina query params de tracking comunes
+    - URL-encodea caracteres inseguros (espacios, tildes, etc.) en el path y el query
+    """
+    from urllib.parse import quote
+
+    url = url.strip()
+
+    # 1. Reemplazar backslashes por forward slashes (Windows path bug)
+    #    Solo en la parte "path" para no romper esquemas raros.
+    url = url.replace("\\", "/")
+    # Colapsar múltiples slashes seguidos (excepto el `//` del esquema)
+    url = re.sub(r"(?<!:)//+", "/", url)
+    # Colapsar slashes generados por backslashes en el path
+    url = re.sub(r"/{2,}", "/", url)
+
+    parsed = urlparse(url)
     scheme = parsed.scheme.lower() or "https"
     netloc = parsed.netloc.lower()
 
+    # 2. Query params: quitar tracking, ordenar
     TRACKING_PARAMS = {
         "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
         "fbclid", "gclid", "sessionid", "sid",
@@ -25,11 +46,16 @@ def normalize_url(url: str) -> str:
     ]
     query = urlencode(sorted(query_pairs))
 
+    # 3. Path: normalizar slashes y encodear caracteres inseguros
     path = parsed.path or "/"
     while "//" in path:
         path = path.replace("//", "/")
     if len(path) > 1 and path.endswith("/"):
         path = path.rstrip("/")
+
+    # URL-encodear solo lo que hace falta, sin tocar `/` ni caracteres ya válidos
+    # `safe="/"` mantiene los slashes; el resto (espacios, tildes, etc.) se codifica
+    path = quote(path, safe="/:@!$&'()*+,;=-._~")
 
     return urlunparse((scheme, netloc, path, "", query, ""))
 
