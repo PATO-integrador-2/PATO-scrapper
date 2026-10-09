@@ -26,7 +26,17 @@ class Repository:
                     json.dumps(ch.get('metadata', {})),
                 )
 
-    async def search(self,embedding:list[float],q:str,limit:int):
-        vec='['+','.join(map(str,embedding))+']'
-        rows=await self.pool.fetch("""SELECT dc.id,d.id document_id,d.title,d.url,dc.content,dc.page_number,1-(dc.embedding <=> $1::vector) score FROM knowledge.document_chunks dc JOIN knowledge.documents d ON d.id=dc.document_id WHERE dc.embedding IS NOT NULL ORDER BY dc.embedding <=> $1::vector LIMIT $2""",vec,limit)
-        return [dict(r) for r in rows]
+    async def search(self, embedding: list[float], q: str, limit: int, min_score: float = 0.35):
+            vec = '[' + ','.join(map(str, embedding)) + ']'
+            rows = await self.pool.fetch(
+                """SELECT dc.id, d.id document_id, d.title, d.url, dc.content, dc.page_number,
+                        1-(dc.embedding <=> $1::vector) score
+                FROM knowledge.document_chunks dc
+                JOIN knowledge.documents d ON d.id=dc.document_id
+                WHERE dc.embedding IS NOT NULL
+                    AND 1-(dc.embedding <=> $1::vector) >= $3
+                ORDER BY dc.embedding <=> $1::vector
+                LIMIT $2""",
+                vec, limit, min_score,
+            )
+            return [dict(r) for r in rows]
