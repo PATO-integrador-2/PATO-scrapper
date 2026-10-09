@@ -158,7 +158,15 @@ def _is_text_block(text: str) -> bool:
 _MATH_CHARS = set("=∑∏√∫≥≤≠≈÷×∗±")
 _NUM_PREFIX_RE = re.compile(r"^(?:\d+(?:\.\d+)*\.?|[IVX]+\.)\s+")
 _BULLET_RE = re.compile(r"^[•▪●◦\-–]\s*")
+_CONTACT_RE = re.compile(r"(@|https?://|www\.)", re.IGNORECASE)
+_DATE_LINE_RE = re.compile(
+    r"^[A-Za-zÁÉÍÓÚáéíóúñ .]+\s*,\s*\d{1,2} de [a-záéíóú]+ (?:de )?\d{4}$"
+)
 
+
+def _heading_core(text: str) -> str:
+    """Título sin viñeta ni numeración, para comparar índice vs. títulos reales."""
+    return _NUM_PREFIX_RE.sub("", _clean_heading(text)).lower().strip(" .:")
 
 def _is_formula(text: str) -> bool:
     """Bloque corto con símbolos matemáticos y letras (no una tabla de números)."""
@@ -276,6 +284,10 @@ def _noise_reason(b: dict, body_size: float, repeated: set[str]) -> str | None:
     text, rect, h = b["text"], b["rect"], b["page_height"]
     if _PAGE_NUM_RE.match(text):
         return "page_number"
+    if len(text) < 120 and _CONTACT_RE.search(text):
+        return "contact"
+    if _DATE_LINE_RE.match(text):
+        return "date_line"
     if _signature(text) in repeated:
         return "repeated_header_footer"
     in_margin = rect.y1 <= h * MARGIN_RATIO or rect.y0 >= h * (1 - MARGIN_RATIO)
@@ -371,12 +383,21 @@ def extract_pdf(content: bytes):
     body_size = _body_size_for(blocks)
     repeated = _repeated_signatures(blocks, total_pages)
 
+    real_headings = {
+        _heading_core(b["text"])
+        for b in blocks
+        if not _is_noise(b, body_size, repeated) and _is_heading(b, body_size)
+    }
+
     by_page: dict[int, list[dict]] = {}
     section: str | None = None
     for b in blocks:
         if _is_noise(b, body_size, repeated):
             continue
         text = b["text"]
+                # Entrada de índice: viñeta cuyo texto coincide con un título real del documento
+        if _BULLET_RE.match(text) and _heading_core(text) in real_headings:
+            continue
         if _is_formula(text):
             by_page.setdefault(b["page"], []).append({"section": section, "text": text})
         elif _is_heading(b, body_size):
