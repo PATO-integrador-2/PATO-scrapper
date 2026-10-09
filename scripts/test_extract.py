@@ -24,7 +24,7 @@ import fitz
 from app.extract.pdf import extract_pdf, chunk_pages, debug_extract
 
 
-DEFAULT_URL = "https://www.dane.gov.co/files/operaciones/PM/pres-PMultidimensional-2025.pdf"
+DEFAULT_URL = "https://www.dane.gov.co/files/operaciones/PM/bol-PMultidimensional-2025.pdf"
 
 
 async def main(url: str) -> None:
@@ -46,6 +46,12 @@ async def main(url: str) -> None:
     for s in info["samples"]:
         print(f"    - {s}")
     print()
+    print("  Títulos detectados:")
+    for s in info["headings"]:
+        print(f"    - {s}")
+    print("  Fórmulas detectadas:")
+    for s in info["formulas"]:
+        print(f"    - {s}")
 
     print("Spans de la página 4 (diagnóstico de palabras pegadas):")
     doc = fitz.open(stream=pdf, filetype="pdf")

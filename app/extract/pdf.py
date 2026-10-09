@@ -15,7 +15,7 @@ import re
 from collections import Counter
 
 import fitz  # PyMuPDF
-
+import unicodedata
 from app.cleaner.text_utils import fix_mojibake
 
 try:
@@ -155,6 +155,36 @@ def _is_text_block(text: str) -> bool:
         return False
     return True
 
+_MATH_CHARS = set("=∑∏√∫≥≤≠≈÷×∗±")
+_NUM_PREFIX_RE = re.compile(r"^(?:\d+(?:\.\d+)*\.?|[IVX]+\.)\s+")
+_BULLET_RE = re.compile(r"^[•▪●◦\-–]\s*")
+
+
+def _is_formula(text: str) -> bool:
+    """Bloque corto con símbolos matemáticos y letras (no una tabla de números)."""
+    if len(text) > 400 or not any(c in _MATH_CHARS for c in text):
+        return False
+    return _digit_ratio(text) < 0.30 and sum(c.isalpha() for c in text) >= 2
+
+
+def _clean_heading(text: str) -> str:
+    return _BULLET_RE.sub("", text).strip()
+
+
+def _is_heading(b: dict, body_size: float) -> bool:
+    text = _clean_heading(b["text"])
+    words = text.split()
+    if not (1 <= len(words) <= 12) or len(text) > 120:
+        return False
+    if text.endswith((".", ":", ";", ",")):
+        return False
+    core = _NUM_PREFIX_RE.sub("", text)
+    numbered = core != text
+    if _letter_ratio(core) < 0.6 or _digit_ratio(core) > 0.10:
+        return False
+    larger = body_size > 0 and b["size"] >= body_size * 1.15
+    return numbered or larger or b.get("bold", False)
+
 def _overlap_fraction(block: "fitz.Rect", other: "fitz.Rect") -> float:
     inter = block & other
     if inter.is_empty or block.get_area() == 0:
@@ -191,7 +221,7 @@ def _collect_blocks(doc: "fitz.Document") -> list[dict]:
             if blk.get("type") != 0:  # 1 = imagen
                 continue
             parts: list[str] = []
-            weighted = chars = 0
+            weighted = chars = bold_chars = 0
             for line in blk.get("lines", []):
                 for span in line.get("spans", []):
                     s = span.get("text", "")
@@ -200,9 +230,13 @@ def _collect_blocks(doc: "fitz.Document") -> list[dict]:
                     parts.append(s)
                     weighted += span.get("size", 0) * len(s)
                     chars += len(s)
+                    if (span.get("flags", 0) & 16) or "bold" in span.get("font", "").lower():
+                        bold_chars += len(s)
             if not chars:
                 continue
-            text = fix_mojibake(" ".join(" ".join(parts).split()))
+            text = unicodedata.normalize(
+                "NFKC", fix_mojibake(" ".join(" ".join(parts).split()))
+            )
             if not text:
                 continue
             collected.append({
@@ -210,6 +244,7 @@ def _collect_blocks(doc: "fitz.Document") -> list[dict]:
                 "rect": fitz.Rect(blk["bbox"]),
                 "text": text,
                 "size": weighted / chars,
+                "bold": bold_chars / chars >= 0.6,
                 "page_height": height,
                 "images": images,
                 "drawings": drawings,
@@ -249,7 +284,7 @@ def _noise_reason(b: dict, body_size: float, repeated: set[str]) -> str | None:
     for r in b["images"]:
         if _overlap_fraction(rect, r) >= OVERLAP_THRESHOLD:
             return "over_image"
-    if _looks_like_chart_text(text):
+    if _looks_like_chart_text(text) and not _is_formula(text):
         for r in b["drawings"]:
             if _overlap_fraction(rect, r) >= OVERLAP_THRESHOLD:
                 return "over_chart"
@@ -281,10 +316,20 @@ def debug_extract(content: bytes) -> dict:
     rep = _repeated_signatures(blocks, total)
     counts: Counter = Counter()
     samples: list[str] = []
+    hsamples: list[str] = []
+    fsamples: list[str] = []
     for b in blocks:
         reason = _noise_reason(b, body, rep)
         if reason is None:
-            if _is_text_block(b["text"]):
+            if _is_formula(b["text"]):
+                reason = "formula"
+                if len(fsamples) < 15:
+                    fsamples.append(b["text"][:100])
+            elif _is_heading(b, body):
+                reason = "heading"
+                if len(hsamples) < 30:
+                    hsamples.append(_clean_heading(b["text"]))
+            elif _is_text_block(b["text"]):
                 reason = "kept"
             else:
                 reason = "not_text_block"
@@ -296,6 +341,8 @@ def debug_extract(content: bytes) -> dict:
         "blocks": len(blocks),
         "reasons": dict(counts),
         "samples": samples,
+        "headings": hsamples,
+        "formulas": fsamples,
     }
 
 def _is_name_list(text: str) -> bool:
@@ -308,8 +355,8 @@ def _is_name_list(text: str) -> bool:
 
 def extract_pdf(content: bytes):
     """
-    Devuelve (páginas, total_páginas). Cada página: {'page_number', 'content'}
-    con solo prosa del cuerpo del documento.
+    Devuelve (páginas, total_páginas). Cada página:
+    {'page_number', 'content', 'segments': [{'section', 'text'}]}
     """
     doc = fitz.open(stream=content, filetype="pdf")
     total_pages = len(doc)
@@ -324,32 +371,80 @@ def extract_pdf(content: bytes):
     body_size = _body_size_for(blocks)
     repeated = _repeated_signatures(blocks, total_pages)
 
-    by_page: dict[int, list[str]] = {}
-    for b in blocks:  # el orden de get_text('dict') ya es de lectura
+    by_page: dict[int, list[dict]] = {}
+    section: str | None = None
+    for b in blocks:
         if _is_noise(b, body_size, repeated):
             continue
-        if _is_text_block(b["text"]):
-            by_page.setdefault(b["page"], []).append(b["text"])
+        text = b["text"]
+        if _is_formula(text):
+            by_page.setdefault(b["page"], []).append({"section": section, "text": text})
+        elif _is_heading(b, body_size):
+            section = _clean_heading(text)   # el título pasa a ser la sección vigente
+        elif _is_text_block(text):
+            by_page.setdefault(b["page"], []).append({"section": section, "text": text})
 
     out = [
-        {"page_number": n, "content": " ".join(parts)}
-        for n, parts in sorted(by_page.items())
+        {
+            "page_number": n,
+            "content": " ".join(s["text"] for s in segs),
+            "segments": segs,
+        }
+        for n, segs in sorted(by_page.items())
     ]
     return out, total_pages
 
 
+MIN_SECTION_WORDS = 40   # secciones más cortas se fusionan con la siguiente
+
+
+def _group_segments(pages):
+    groups = []
+    for p in pages:
+        for seg in p.get("segments", []):
+            if groups and groups[-1]["section"] == seg["section"]:
+                groups[-1]["parts"].append(seg["text"])
+            else:
+                groups.append({"section": seg["section"], "page": p["page_number"],
+                               "parts": [seg["text"]]})
+    return groups
+
+
+def _merge_small(groups):
+    """Una sección corta no se pierde: se antepone (con su título) a la siguiente."""
+    merged, carry = [], ""
+    for g in groups:
+        text = " ".join(g["parts"])
+        if len(text.split()) < MIN_SECTION_WORDS:
+            label = f"{g['section']}. " if g["section"] else ""
+            carry = f"{carry} {label}{text}".strip()
+            continue
+        if carry:
+            text, carry = f"{carry} {text}", ""
+        merged.append({"section": g["section"], "page": g["page"], "text": text})
+    if carry:
+        if merged:
+            merged[-1]["text"] += " " + carry
+        elif groups:
+            merged.append({"section": None, "page": groups[0]["page"], "text": carry})
+    return merged
+
+
 def chunk_pages(pages, max_words: int = 450, overlap: int = 60):
     out = []
-    for p in pages:
-        words = p["content"].split()
-        if not words:
-            continue
+    for g in _merge_small(_group_segments(pages)):
+        words = g["text"].split()
         start = 0
         while start < len(words):
             end = min(len(words), start + max_words)
             chunk_text = " ".join(words[start:end])
             if _is_prose_block(chunk_text):
-                out.append({"page_number": p["page_number"], "content": chunk_text})
+                content = f"{g['section']}. {chunk_text}" if g["section"] else chunk_text
+                out.append({
+                    "page_number": g["page"],
+                    "section": g["section"],
+                    "content": content,
+                })
             if end == len(words):
                 break
             start = end - overlap
