@@ -1,11 +1,13 @@
+import asyncio
 import hashlib
+import json
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 import httpx
 
 from app.extract.pdf import extract_pdf, chunk_pages
-from app.retrieval.embeddings import embed
+from app.retrieval.embeddings import DOC_PREFIX, QUERY_PREFIX, embed, embed_batch
 from app.services.storage import RawObjectStorage
 
 
@@ -13,11 +15,20 @@ class IngestRequest(BaseModel):
     url: HttpUrl
     title: str | None = None
     organization: str | None = None
+    force: bool = False  # re-embeber aunque el PDF (mismo sha256) ya tenga chunks
 
 
 class SearchRequest(BaseModel):
-    query: str
-    limit: int = 5
+    query: str = Field(min_length=1)
+    limit: int = Field(default=5, ge=1, le=50)
+
+    @field_validator('query')
+    @classmethod
+    def query_not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError('query must not be blank')
+        return v
 
 
 def build_knowledge_router(settings):
@@ -32,6 +43,19 @@ def build_knowledge_router(settings):
         if 'pdf' not in resp.headers.get('content-type', '').lower() and not str(body.url).lower().endswith('.pdf'):
             raise HTTPException(415, 'only_pdf_supported')
         h = hashlib.sha256(data).hexdigest()
+        repo = request.app.state.knowledge_repo
+        existing = None if body.force else await repo.embedded_document(h)
+        if existing:
+            meta = existing['metadata']
+            meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
+            return {
+                'document_id': str(existing['id']),
+                'pages': meta.get('page_count'),
+                'chunks': existing['chunks'],
+                'sha256': h,
+                'object_key': meta.get('object_key'),
+                'skipped': True,
+            }
         storage = RawObjectStorage(
             settings.object_storage_endpoint,
             settings.object_storage_access_key,
@@ -40,9 +64,9 @@ def build_knowledge_router(settings):
             settings.object_storage_region,
         )
         stored = storage.put(data, str(body.url), resp.headers.get('content-type', 'application/pdf'))
-        pages, count = extract_pdf(data)
-        chunks = chunk_pages(pages)
-        repo = request.app.state.knowledge_repo
+        # PyMuPDF es síncrono: en un hilo para no bloquear el event loop con PDFs grandes
+        pages, count = await asyncio.to_thread(extract_pdf, data)
+        chunks = await asyncio.to_thread(chunk_pages, pages)
         row = await repo.document(
             title=body.title or str(body.url).split('/')[-1],
             organization=body.organization,
@@ -50,8 +74,9 @@ def build_knowledge_router(settings):
             sha256=h,
             metadata={'page_count': count, 'storage_bucket': stored.bucket, 'object_key': stored.object_key},
         )
-        for ch in chunks:
-            ch['embedding'] = await embed(settings.ollama_url, settings.embedding_model, ch['content'])
+        vectors = await embed_batch(settings.ollama_url, settings.embedding_model, [DOC_PREFIX + ch['content'] for ch in chunks])
+        for ch, v in zip(chunks, vectors):
+            ch['embedding'] = v
         await repo.chunks(row['id'], chunks)
         return {
             'document_id': str(row['id']),
@@ -63,7 +88,7 @@ def build_knowledge_router(settings):
 
     @r.post('/search')
     async def search(body: SearchRequest, request: Request):
-        v = await embed(settings.ollama_url, settings.embedding_model, body.query)
+        v = await embed(settings.ollama_url, settings.embedding_model, QUERY_PREFIX + body.query)
         rows = await request.app.state.knowledge_repo.search(v, body.query, body.limit)
         return {'results': rows}
 
