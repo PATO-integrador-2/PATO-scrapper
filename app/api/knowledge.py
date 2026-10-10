@@ -1,33 +1,48 @@
 import asyncio
 import hashlib
 import json
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field, HttpUrl, field_validator
 import httpx
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, HttpUrl, field_validator
 
 from app.extract.pdf import extract_pdf, chunk_pages
-from app.retrieval.embeddings import DOC_PREFIX, QUERY_PREFIX, embed, embed_batch
+from app.retrieval.embeddings import DOC_PREFIX, embed, embed_batch
 from app.services.storage import RawObjectStorage
+
+ORG_BY_DOMAIN = {
+    "cepal.org": "CEPAL",
+    "dane.gov.co": "DANE",
+}
+
+
+def organization_from_url(url: str) -> str | None:
+    host = (urlparse(url).hostname or "").lower()
+    for domain, org in ORG_BY_DOMAIN.items():
+        if host == domain or host.endswith("." + domain):
+            return org
+    return host or None
 
 
 class IngestRequest(BaseModel):
     url: HttpUrl
     title: str | None = None
     organization: str | None = None
-    force: bool = False  # re-embeber aunque el PDF (mismo sha256) ya tenga chunks
+    force: bool = False
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(min_length=1)
-    limit: int = Field(default=5, ge=1, le=50)
+    query: str
+    limit: int = 5
+    organization: str | None = None
 
-    @field_validator('query')
+    @field_validator("query")
     @classmethod
     def query_not_blank(cls, v: str) -> str:
         v = v.strip()
         if not v:
-            raise ValueError('query must not be blank')
+            raise ValueError("query no puede estar vacía")
         return v
 
 
@@ -42,8 +57,11 @@ def build_knowledge_router(settings):
             data = resp.content
         if 'pdf' not in resp.headers.get('content-type', '').lower() and not str(body.url).lower().endswith('.pdf'):
             raise HTTPException(415, 'only_pdf_supported')
+
         h = hashlib.sha256(data).hexdigest()
         repo = request.app.state.knowledge_repo
+
+        # Si ya está ingestado con embeddings, se omite (salvo force=true)
         existing = None if body.force else await repo.embedded_document(h)
         if existing:
             meta = existing['metadata']
@@ -56,6 +74,7 @@ def build_knowledge_router(settings):
                 'object_key': meta.get('object_key'),
                 'skipped': True,
             }
+
         storage = RawObjectStorage(
             settings.object_storage_endpoint,
             settings.object_storage_access_key,
@@ -64,20 +83,35 @@ def build_knowledge_router(settings):
             settings.object_storage_region,
         )
         stored = storage.put(data, str(body.url), resp.headers.get('content-type', 'application/pdf'))
-        # PyMuPDF es síncrono: en un hilo para no bloquear el event loop con PDFs grandes
+
+        # PyMuPDF es síncrono: en un hilo para no bloquear el event loop
         pages, count = await asyncio.to_thread(extract_pdf, data)
         chunks = await asyncio.to_thread(chunk_pages, pages)
+
         row = await repo.document(
             title=body.title or str(body.url).split('/')[-1],
-            organization=body.organization,
+            organization=body.organization or organization_from_url(str(body.url)),
             url=str(body.url),
             sha256=h,
-            metadata={'page_count': count, 'storage_bucket': stored.bucket, 'object_key': stored.object_key},
+            metadata={
+                'page_count': count,
+                'storage_bucket': stored.bucket,
+                'object_key': stored.object_key,
+            },
         )
-        vectors = await embed_batch(settings.ollama_url, settings.embedding_model, [DOC_PREFIX + ch['content'] for ch in chunks])
-        for ch, v in zip(chunks, vectors):
-            ch['embedding'] = v
+
+        if chunks:
+            vectors = await embed_batch(
+                settings.ollama_url,
+                settings.embedding_model,
+                [DOC_PREFIX + ch['content'] for ch in chunks],
+            )
+            if len(vectors) != len(chunks):
+                raise HTTPException(502, 'embedding_count_mismatch')
+            for ch, v in zip(chunks, vectors):
+                ch['embedding'] = v
         await repo.chunks(row['id'], chunks)
+
         return {
             'document_id': str(row['id']),
             'pages': count,
@@ -88,8 +122,10 @@ def build_knowledge_router(settings):
 
     @r.post('/search')
     async def search(body: SearchRequest, request: Request):
-        v = await embed(settings.ollama_url, settings.embedding_model, QUERY_PREFIX + body.query)
-        rows = await request.app.state.knowledge_repo.search(v, body.query, body.limit)
+        v = await embed(settings.ollama_url, settings.embedding_model, body.query, kind='query')
+        rows = await request.app.state.knowledge_repo.search(
+            v, body.query, body.limit, organization=body.organization
+        )
         return {'results': rows}
 
     return r
