@@ -158,6 +158,7 @@ DASHBOARD_02_HOGARES = TableSpec(
         ColumnSpec("anio", "int"),
         ColumnSpec("directorio", "int"),
         ColumnSpec("secuencia_p", "int"),
+        ColumnSpec("secuencia_encuesta", "int"),
         ColumnSpec("region", "int"),
         ColumnSpec("departamento", "int"),
         ColumnSpec("personas_hogar", "int"),
@@ -167,7 +168,9 @@ DASHBOARD_02_HOGARES = TableSpec(
         ColumnSpec("fex_c", "float"),
     ),
     # La clave natural es el identificador del hogar en la ECV
-    # (DIRECTORIO + SECUENCIA_P), no su perfil: dos hogares distintos
+    # (DIRECTORIO + SECUENCIA_P + SECUENCIA_ENCUESTA; en 2018-2022 y
+    # 2024 DIRECTORIO + SECUENCIA_P se repite en cientos de hogares
+    # distintos), no su perfil: dos hogares distintos
     # con el mismo tamaño, IPM y privaciones son dos observaciones
     # válidas de la encuesta. Deduplicar por perfil colapsaba los
     # hogares no pobres (casi todos con perfiles idénticos) y dejaba
@@ -177,6 +180,7 @@ DASHBOARD_02_HOGARES = TableSpec(
         "anio",
         "directorio",
         "secuencia_p",
+        "secuencia_encuesta",
     ),
     # "region" no está en required_header_keys porque el microdato
     # 2024 solo trae DEPARTAMENTO (sin desagregación de región); ver
@@ -184,7 +188,15 @@ DASHBOARD_02_HOGARES = TableSpec(
     # "directorio" y "fex_c" son obligatorios: sin el id del hogar no
     # hay clave natural, y sin el factor de expansión no se puede
     # reproducir la incidencia oficial (que es ponderada).
-    required_header_keys=("directorio", "departamento", "ipm", "pobre", "fex_c"),
+    required_header_keys=(
+        "directorio",
+        "secuencia_p",
+        "secuencia_encuesta",
+        "departamento",
+        "ipm",
+        "pobre",
+        "fex_c",
+    ),
     header_key_aliases={
         # Encabezados reales del microdato de hogares del DANE
         # (BDATOS-IPM-<año>.zip, hoja "HOGARES (DEPARTAMENTAL) <año>"),

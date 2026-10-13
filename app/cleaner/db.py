@@ -231,19 +231,73 @@ def get_or_create_geographic_area_by_code(
     return cursor.fetchone()[0]
 
 
+HOUSEHOLD_ID_TAG = "hogar="
+
+HOUSEHOLD_COLUMNS = (
+    "geographic_area_id",
+    "period",
+    "household_size",
+    "ipm_value",
+    "is_poor",
+    "source",
+    "extracted_at",
+)
+
+
+def household_source(row: dict) -> str:
+    """
+    El esquema de household_record no se puede alterar (ni columnas
+    nuevas ni borrar filas), así que el id del hogar en la ECV y su
+    factor de expansión viajan dentro de `source`:
+    '<fuente> | hogar=<DIRECTORIO-SECUENCIA_P-SECUENCIA_ENCUESTA> | fex=<FEX_C>'.
+    El id hace idempotente la recarga; el fex permite calcular la
+    incidencia oficial (ponderada) con
+    split_part(split_part(source, 'fex=', 2), ' ', 1)::numeric.
+    """
+
+    parts = [row.get("source") or "DANE"]
+
+    if row.get("survey_household_id"):
+        parts.append(f"{HOUSEHOLD_ID_TAG}{row['survey_household_id']}")
+
+    if row.get("expansion_factor") is not None:
+        parts.append(f"fex={row['expansion_factor']}")
+
+    return " | ".join(parts)
+
+
+def _column_types(cursor, table: str) -> dict[str, str]:
+
+    cursor.execute(
+        """
+        SELECT attname, format_type(atttypid, atttypmod)
+        FROM pg_attribute
+        WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped
+        """,
+        (table,),
+    )
+
+    return dict(cursor.fetchall())
+
+
 def insert_household_records(
     cursor,
     rows: list[dict],
 ) -> list[str]:
     """
-    Inserta/actualiza filas de household_record en un solo batch y
-    devuelve sus ids en el mismo orden de `rows`. Cada fila es un
-    hogar de la ECV, identificado por (period, survey_household_id)
-    = año + DIRECTORIO-SECUENCIA_P, con su factor de expansión
-    (FEX_C) para poder reproducir la incidencia oficial ponderada.
-    El UPSERT sobre esa clave hace idempotente recargar el mismo año
-    (requiere el índice único de
-    docs/migrations/001_household_record_expansion_factor.sql).
+    Escribe los hogares en household_record usando solo UPDATE e
+    INSERT (sin DELETE ni cambios de esquema) y devuelve sus ids en el
+    mismo orden de `rows`:
+
+    1. Un hogar ya cargado (mismo period + 'hogar=<id>' en source) se
+       actualiza en su misma fila: recargar un año es idempotente.
+    2. Si no, se reutiliza una fila "vieja" (sin 'hogar=' en source,
+       p. ej. los perfiles colapsados por la deduplicación anterior),
+       sobrescribiéndola por completo, para que no quede ningún dato
+       erróneo en la tabla. Sus 15 household_deprivation se
+       sobrescriben después por el UPSERT de privaciones.
+    3. Si no quedan filas viejas, se inserta.
+
     Cada dict de `rows` debe traer: geographic_area_id, period,
     household_size, ipm_value, is_poor, expansion_factor,
     survey_household_id, source, extracted_at.
@@ -252,44 +306,100 @@ def insert_household_records(
     if not rows:
         return []
 
-    insert_sql = """
-        INSERT INTO household_record (
-            geographic_area_id, period, household_size,
-            ipm_value, is_poor, expansion_factor,
-            survey_household_id, source, extracted_at
-        )
-        VALUES %s
-        ON CONFLICT (period, survey_household_id) DO UPDATE SET
-            geographic_area_id = EXCLUDED.geographic_area_id,
-            household_size = EXCLUDED.household_size,
-            ipm_value = EXCLUDED.ipm_value,
-            is_poor = EXCLUDED.is_poor,
-            expansion_factor = EXCLUDED.expansion_factor,
-            source = EXCLUDED.source,
-            extracted_at = EXCLUDED.extracted_at
-        RETURNING id
-    """
+    periods = sorted({row["period"] for row in rows})
 
-    values = [
-        (
+    cursor.execute(
+        """
+        SELECT id, period, split_part(split_part(source, %s, 2), ' ', 1)
+        FROM household_record
+        WHERE period = ANY(%s) AND source LIKE %s
+        """,
+        (HOUSEHOLD_ID_TAG, periods, f"%{HOUSEHOLD_ID_TAG}%"),
+    )
+
+    loaded = {
+        (period, survey_id): record_id
+        for record_id, period, survey_id in cursor.fetchall()
+    }
+
+    cursor.execute(
+        """
+        SELECT id FROM household_record
+        WHERE source IS NULL OR source NOT LIKE %s
+        ORDER BY period DESC, id DESC
+        FOR UPDATE
+        """,
+        (f"%{HOUSEHOLD_ID_TAG}%",),
+    )
+
+    reusable = [record_id for (record_id,) in cursor.fetchall()]
+
+    ids: list = [None] * len(rows)
+    updates: list[tuple] = []
+    inserts: list[tuple[int, tuple]] = []
+
+    for index, row in enumerate(rows):
+
+        values = (
             row["geographic_area_id"],
             row["period"],
             row["household_size"],
             row["ipm_value"],
             row["is_poor"],
-            row["expansion_factor"],
-            row["survey_household_id"],
-            row["source"],
+            household_source(row),
             row["extracted_at"],
         )
-        for row in rows
-    ]
 
-    ids = psycopg2.extras.execute_values(
-        cursor, insert_sql, values, fetch=True, page_size=1000
-    )
+        record_id = loaded.get((row["period"], row.get("survey_household_id")))
 
-    return [row[0] for row in ids]
+        if record_id is None and reusable:
+            record_id = reusable.pop()
+
+        if record_id is None:
+            inserts.append((index, values))
+            continue
+
+        ids[index] = record_id
+        updates.append((record_id, *values))
+
+    if updates:
+
+        types = _column_types(cursor, "household_record")
+
+        assignments = ", ".join(
+            f"{column} = v.{column}::{types[column]}"
+            for column in HOUSEHOLD_COLUMNS
+        )
+
+        psycopg2.extras.execute_values(
+            cursor,
+            f"""
+            UPDATE household_record AS hr SET {assignments}
+            FROM (VALUES %s) AS v(id, {", ".join(HOUSEHOLD_COLUMNS)})
+            WHERE hr.id = v.id::{types["id"]}
+            """,
+            updates,
+            page_size=1000,
+        )
+
+    if inserts:
+
+        new_ids = psycopg2.extras.execute_values(
+            cursor,
+            f"""
+            INSERT INTO household_record ({", ".join(HOUSEHOLD_COLUMNS)})
+            VALUES %s
+            RETURNING id
+            """,
+            [values for _, values in inserts],
+            fetch=True,
+            page_size=1000,
+        )
+
+        for (index, _), (record_id,) in zip(inserts, new_ids):
+            ids[index] = record_id
+
+    return ids
 
 
 def upsert_household_deprivations(

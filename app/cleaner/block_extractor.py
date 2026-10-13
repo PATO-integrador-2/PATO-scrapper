@@ -696,15 +696,22 @@ def extract_blocks_from_csv(path: str) -> list[DataBlock]:
 
     import csv
 
+    # utf-8-sig quita el BOM con que el DANE publica varios CSV. Los
+    # microdatos 2018-2020 vienen separados por ';' en vez de ','.
     with open(
         path,
         "r",
-        encoding="utf-8",
+        encoding="utf-8-sig",
         errors="replace",
         newline="",
     ) as handle:
 
-        reader = csv.reader(handle)
+        first_line = handle.readline()
+        handle.seek(0)
+
+        delimiter = ";" if first_line.count(";") > first_line.count(",") else ","
+
+        reader = csv.reader(handle, delimiter=delimiter)
 
         rows = [tuple(row) for row in reader]
 

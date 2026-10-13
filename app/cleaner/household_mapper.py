@@ -144,8 +144,9 @@ PRIVACION_INDICATOR_REFS: dict[str, IndicatorRef] = {
 
 def _survey_household_id(row: dict) -> str | None:
     """
-    Identificador del hogar en la ECV: DIRECTORIO-SECUENCIA_P (una
-    vivienda puede tener varios hogares). None si falta DIRECTORIO.
+    Identificador del hogar en la ECV:
+    DIRECTORIO-SECUENCIA_P-SECUENCIA_ENCUESTA (DIRECTORIO-SECUENCIA_P
+    solo no es único en varios años). None si falta DIRECTORIO.
     """
 
     directorio = row.get("directorio")
@@ -153,9 +154,13 @@ def _survey_household_id(row: dict) -> str | None:
     if directorio is None:
         return None
 
-    secuencia_p = row.get("secuencia_p")
+    parts = [int(directorio)]
 
-    return f"{int(directorio)}-{int(secuencia_p) if secuencia_p is not None else 1}"
+    for column in ("secuencia_p", "secuencia_encuesta"):
+        value = row.get(column)
+        parts.append(int(value) if value is not None else 1)
+
+    return "-".join(str(part) for part in parts)
 
 
 def row_to_household(row: dict) -> dict | None:
