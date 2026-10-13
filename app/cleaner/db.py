@@ -236,21 +236,17 @@ def insert_household_records(
     rows: list[dict],
 ) -> list[str]:
     """
-    Inserta filas nuevas en household_record en un solo batch y
-    devuelve sus ids en el mismo orden de `rows`. household_record no
-    tiene restricción UNIQUE — cada fila representa un perfil de
-    hogar (geo + tamaño + IPM + pobre + su conjunto de privaciones)
-    ya deduplicado río arriba por table_mapper._dedupe_rows usando la
-    clave natural completa de dashboard_02 (que sí incluye las 15
-    privaciones). Deduplicar aquí solo por
-    (geographic_area_id, period, household_size, ipm_value, is_poor)
-    —sin las privaciones— colapsaría hogares distintos que comparten
-    esos cinco campos pero difieren en qué privaciones sufren, así
-    que se inserta siempre en vez de buscar coincidencias previas;
-    recargar el mismo job duplica los perfiles, igual que duplicaría
-    filas en el CSV de origen si se reprocesara sin deduplicar.
+    Inserta/actualiza filas de household_record en un solo batch y
+    devuelve sus ids en el mismo orden de `rows`. Cada fila es un
+    hogar de la ECV, identificado por (period, survey_household_id)
+    = año + DIRECTORIO-SECUENCIA_P, con su factor de expansión
+    (FEX_C) para poder reproducir la incidencia oficial ponderada.
+    El UPSERT sobre esa clave hace idempotente recargar el mismo año
+    (requiere el índice único de
+    docs/migrations/001_household_record_expansion_factor.sql).
     Cada dict de `rows` debe traer: geographic_area_id, period,
-    household_size, ipm_value, is_poor, source, extracted_at.
+    household_size, ipm_value, is_poor, expansion_factor,
+    survey_household_id, source, extracted_at.
     """
 
     if not rows:
@@ -259,9 +255,18 @@ def insert_household_records(
     insert_sql = """
         INSERT INTO household_record (
             geographic_area_id, period, household_size,
-            ipm_value, is_poor, source, extracted_at
+            ipm_value, is_poor, expansion_factor,
+            survey_household_id, source, extracted_at
         )
         VALUES %s
+        ON CONFLICT (period, survey_household_id) DO UPDATE SET
+            geographic_area_id = EXCLUDED.geographic_area_id,
+            household_size = EXCLUDED.household_size,
+            ipm_value = EXCLUDED.ipm_value,
+            is_poor = EXCLUDED.is_poor,
+            expansion_factor = EXCLUDED.expansion_factor,
+            source = EXCLUDED.source,
+            extracted_at = EXCLUDED.extracted_at
         RETURNING id
     """
 
@@ -272,6 +277,8 @@ def insert_household_records(
             row["household_size"],
             row["ipm_value"],
             row["is_poor"],
+            row["expansion_factor"],
+            row["survey_household_id"],
             row["source"],
             row["extracted_at"],
         )
@@ -279,7 +286,7 @@ def insert_household_records(
     ]
 
     ids = psycopg2.extras.execute_values(
-        cursor, insert_sql, values, fetch=True
+        cursor, insert_sql, values, fetch=True, page_size=1000
     )
 
     return [row[0] for row in ids]

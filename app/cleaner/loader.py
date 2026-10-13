@@ -272,9 +272,10 @@ def _load_household_table(cursor, rows: list[dict]) -> dict:
     Solo hay 39 áreas geográficas posibles (6 regiones + 33
     departamentos) y 15 indicadores de privación fijos, así que se
     resuelven una sola vez y se cachean en memoria — sin esto, un
-    archivo de ~18.700 hogares dispara cientos de miles de
+    archivo de miles de hogares dispara cientos de miles de
     round-trips redundantes a la base de datos (uno por privación por
-    hogar) para resolver siempre los mismos 15 códigos.
+    hogar) para resolver siempre los mismos 15 códigos (un año del
+    microdato trae ~87.000 hogares).
     """
 
     if not rows:
@@ -366,6 +367,8 @@ def _load_household_table(cursor, rows: list[dict]) -> dict:
                 "household_size": household["household_size"],
                 "ipm_value": household["ipm_value"],
                 "is_poor": household["is_poor"],
+                "expansion_factor": household["expansion_factor"],
+                "survey_household_id": household["survey_household_id"],
                 "source": household["source"],
                 "extracted_at": household["extracted_at"],
             }

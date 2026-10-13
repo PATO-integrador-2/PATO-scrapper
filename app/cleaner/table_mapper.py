@@ -1,5 +1,7 @@
 import re
 
+from pathlib import Path
+
 from app.cleaner.block_extractor import DataBlock
 from app.cleaner.schema import ALL_TABLES, ColumnSpec, TableSpec
 from app.cleaner.text_utils import slugify_column
@@ -244,7 +246,13 @@ def map_block_to_rows(block: DataBlock, spec: TableSpec) -> list[dict]:
     inferred_year = None
 
     if "anio" not in column_source:
-        inferred_year = _infer_year_from_title(block.title)
+        # Un CSV plano (p. ej. el microdato "HOGARES (DEPARTAMENTAL)
+        # 2025.csv") no tiene título: el año solo está en el nombre
+        # del archivo. Sin él, anio queda en None y _dedupe_rows
+        # descarta todas las filas.
+        inferred_year = _infer_year_from_title(block.title) or _infer_year_from_title(
+            Path(block.source_file or "").stem
+        )
 
     mapped_rows: list[dict] = []
 

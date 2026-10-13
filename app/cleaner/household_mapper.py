@@ -142,6 +142,22 @@ PRIVACION_INDICATOR_REFS: dict[str, IndicatorRef] = {
 }
 
 
+def _survey_household_id(row: dict) -> str | None:
+    """
+    Identificador del hogar en la ECV: DIRECTORIO-SECUENCIA_P (una
+    vivienda puede tener varios hogares). None si falta DIRECTORIO.
+    """
+
+    directorio = row.get("directorio")
+
+    if directorio is None:
+        return None
+
+    secuencia_p = row.get("secuencia_p")
+
+    return f"{int(directorio)}-{int(secuencia_p) if secuencia_p is not None else 1}"
+
+
 def row_to_household(row: dict) -> dict | None:
     """
     Convierte una fila de `dashboard_02` en un dict con las claves
@@ -209,6 +225,8 @@ def row_to_household(row: dict) -> dict | None:
         "household_size": household_size,
         "ipm_value": ipm_value,
         "is_poor": bool(is_poor),
+        "expansion_factor": row.get("fex_c"),
+        "survey_household_id": _survey_household_id(row),
         "deprivations": deprivations,
         "source": row.get("fuente"),
         "extracted_at": row.get("fecha_extraccion"),

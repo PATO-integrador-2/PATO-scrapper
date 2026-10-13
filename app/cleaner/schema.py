@@ -156,29 +156,35 @@ DASHBOARD_02_HOGARES = TableSpec(
     dashboard="dashboard_02",
     columns=(
         ColumnSpec("anio", "int"),
+        ColumnSpec("directorio", "int"),
+        ColumnSpec("secuencia_p", "int"),
         ColumnSpec("region", "int"),
         ColumnSpec("departamento", "int"),
         ColumnSpec("personas_hogar", "int"),
         *(ColumnSpec(col, "boolean") for col in PRIVACION_COLUMNS),
         ColumnSpec("ipm", "float"),
         ColumnSpec("pobre", "boolean"),
+        ColumnSpec("fex_c", "float"),
     ),
-    # "region" queda fuera de la clave natural (a diferencia de
-    # "departamento") porque el microdato 2024 no la trae: si
-    # estuviera aquí, _dedupe_rows descartaría todas sus filas por
-    # tener ese campo en None.
+    # La clave natural es el identificador del hogar en la ECV
+    # (DIRECTORIO + SECUENCIA_P), no su perfil: dos hogares distintos
+    # con el mismo tamaño, IPM y privaciones son dos observaciones
+    # válidas de la encuesta. Deduplicar por perfil colapsaba los
+    # hogares no pobres (casi todos con perfiles idénticos) y dejaba
+    # ~19 mil de ~87 mil hogares, inflando la incidencia 2-7 veces
+    # frente al anexo departamental del DANE.
     natural_key=(
         "anio",
-        "departamento",
-        "personas_hogar",
-        *PRIVACION_COLUMNS,
-        "ipm",
-        "pobre",
+        "directorio",
+        "secuencia_p",
     ),
     # "region" no está en required_header_keys porque el microdato
     # 2024 solo trae DEPARTAMENTO (sin desagregación de región); ver
     # household_mapper.row_to_household, que ya maneja region_code=None.
-    required_header_keys=("departamento", "ipm", "pobre"),
+    # "directorio" y "fex_c" son obligatorios: sin el id del hogar no
+    # hay clave natural, y sin el factor de expansión no se puede
+    # reproducir la incidencia oficial (que es ponderada).
+    required_header_keys=("directorio", "departamento", "ipm", "pobre", "fex_c"),
     header_key_aliases={
         # Encabezados reales del microdato de hogares del DANE
         # (BDATOS-IPM-<año>.zip, hoja "HOGARES (DEPARTAMENTAL) <año>"),
