@@ -6,6 +6,7 @@ from uuid import UUID
 import httpx
 
 from app.adapters.sources import build_adapters
+from app.api.ingestion import DiscoverRequest
 from app.core.config import Settings
 from app.db.repository import IngestionRepository
 from app.services.downloader import Downloader
@@ -20,17 +21,32 @@ class IngestionService:
         self.settings = settings
         self.repo = repo
 
-    async def discover(self) -> dict:
+    async def discover(self, overrides: "DiscoverRequest" | None = None) -> dict:
         headers = {"User-Agent": self.settings.user_agent}
         timeout = httpx.Timeout(
             self.settings.discovery_request_timeout,
             connect=10.0,
             read=self.settings.discovery_request_timeout,
         )
+
+        seed_urls = tuple(overrides.seed_urls) if overrides and overrides.seed_urls else self.settings.discovery_seed_urls
+        allowed_domains = tuple(overrides.allowed_domains) if overrides and overrides.allowed_domains else self.settings.allowed_domains
+        keywords = tuple(overrides.keywords) if overrides and overrides.keywords else self.settings.discovery_keywords
+        max_depth = overrides.max_depth if overrides and overrides.max_depth is not None else self.settings.discovery_max_depth
+        max_pages = overrides.max_pages if overrides and overrides.max_pages is not None else self.settings.discovery_max_pages
+
         async with httpx.AsyncClient(
             timeout=timeout, follow_redirects=True, headers=headers
         ) as client:
-            adapters = build_adapters(self.settings, client)
+            adapters = build_adapters(
+                settings=self.settings,
+                client=client,
+                seed_urls=seed_urls,
+                allowed_domains=allowed_domains,
+                keywords=keywords,
+                max_depth=max_depth,
+                max_pages=max_pages
+            )
             result = {"sources": {}}
             for adapter in adapters:
                 if not adapter.seed_urls:

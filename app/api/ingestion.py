@@ -1,10 +1,17 @@
 from uuid import UUID
-
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel  # <-- NUEVO IMPORT
 
 from app.core.config import Settings
 from app.services.ingestion import IngestionService
 from app.services.cepal_api_ingestion import CepalAPIIngestionService
+
+class DiscoverRequest(BaseModel):
+    seed_urls: list[str] | None = None
+    allowed_domains: list[str] | None = None
+    keywords: list[str] | None = None
+    max_depth: int | None = None
+    max_pages: int | None = None
 
 
 
@@ -47,7 +54,8 @@ def build_router(settings: Settings) -> APIRouter:
 
     @router.post("/discover")
     async def discover(request: Request) -> dict:
-        return await service(request).discover()
+        async def discover(request: Request, body: DiscoverRequest | None = None) -> dict:
+             return await service(request).discover(overrides=body)
 
     @router.post("/runs/{run_id}/download")
     async def download(request: Request, run_id: UUID, limit: int = Query(default=20, ge=1, le=100)) -> dict:
@@ -158,7 +166,7 @@ def build_router(settings: Settings) -> APIRouter:
         )
         return {"reset": int(result.split()[-1]) if result else 0}
 
-    return router
+   
 
     @router.post("/knowledge/queue/reset-done")
     async def knowledge_queue_reset_done(
@@ -201,4 +209,4 @@ def build_router(settings: Settings) -> APIRouter:
             n = 0
         return {"reset": n}
 
-
+    return router
