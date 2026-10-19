@@ -1,17 +1,16 @@
 from __future__ import annotations
-
 import logging
+from typing import Any  # <-- Añadido
 from uuid import UUID
-
 import httpx
 
 from app.adapters.sources import build_adapters
-from app.api.ingestion import DiscoverRequest
 from app.core.config import Settings
 from app.db.repository import IngestionRepository
 from app.services.downloader import Downloader
 from app.services.storage import RawObjectStorage
 from app.etl.processor import ETLProcessor
+
 
 log = logging.getLogger(__name__)
 
@@ -21,7 +20,7 @@ class IngestionService:
         self.settings = settings
         self.repo = repo
 
-    async def discover(self, overrides: "DiscoverRequest" | None = None) -> dict:
+    async def discover(self, overrides: Any | None = None) -> dict:
         headers = {"User-Agent": self.settings.user_agent}
         timeout = httpx.Timeout(
             self.settings.discovery_request_timeout,
